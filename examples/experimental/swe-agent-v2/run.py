@@ -42,6 +42,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     # Training settings
     max_seq_len: int = 16384
+    rollout_max_response_len: int = 8192
+    num_rollout: int = 3000
     rollout_batch_size: int = 2
     n_samples_per_prompt: int = 4
     global_batch_size: int = 8
@@ -51,6 +53,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
         "AGENT_SERVER_URL", os.environ.get("SWE_AGENT_URL", "http://agent_env:11000")
     )
     agent_model_name: str = os.environ.get("AGENT_MODEL_NAME", "model")
+    agent_server_auth_token: str = os.environ.get(
+        "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+    )
+    agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
     harbor_tasks_dir: str = os.environ.get("HARBOR_TASKS_DIR", "/root/harbor_tasks")
     router_external_host: str = os.environ.get("MILES_ROUTER_EXTERNAL_HOST", socket.gethostname())  # public IP
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", socket.gethostname())  # cluster/pod IP
@@ -108,11 +115,11 @@ def execute(args: ScriptArgs):
         "--input-key prompt "
         "--metadata-key metadata "
         "--rollout-shuffle "
-        "--num-rollout 3000 "
+        f"--num-rollout {args.num_rollout} "
         f"--rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
         "--rollout-temperature 0.8 "
-        "--rollout-max-response-len 8192 "
+        f"--rollout-max-response-len {args.rollout_max_response_len} "
         f"--max-seq-len {args.max_seq_len} "
         f"--global-batch-size {args.global_batch_size} "
         "--balance-data "
@@ -172,7 +179,7 @@ def execute(args: ScriptArgs):
         "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
         "--tito-model glm47 "
         "--use-session-server "
-        "--session-server-port 30000 "
+        f"--session-server-port {args.session_server_port} "
         # This is required by terminus-2 harness
         "--tito-allowed-append-roles user tool "
     )
@@ -231,6 +238,8 @@ def execute(args: ScriptArgs):
         "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
+        "AGENT_SERVER_AUTH_TOKEN": args.agent_server_auth_token,
+        "AGENT_SERVER_TIMEOUT_SEC": str(args.agent_server_timeout_sec),
         "MILES_ROUTER_EXTERNAL_HOST": args.router_external_host,
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
         "MILES_HOST_IP": args.miles_host_ip,

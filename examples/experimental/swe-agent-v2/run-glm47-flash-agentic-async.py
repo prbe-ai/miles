@@ -78,6 +78,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Agent settings
     agent_server_url: str = os.environ.get("AGENT_SERVER_URL", "http://ts-egress-aws-agent-server:8080")
     agent_model_name: str = os.environ.get("AGENT_MODEL_NAME", "model")
+    agent_server_auth_token: str = os.environ.get(
+        "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+    )
+    agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
     harbor_tasks_dir: str = os.environ.get("HARBOR_TASKS_DIR", "/root/harbor_tasks")
     router_external_host: str = os.environ.get("MILES_ROUTER_EXTERNAL_HOST", "")
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", "")
@@ -281,7 +286,7 @@ def execute(args: ScriptArgs):
         "--custom-rm-path generate.reward_func "
         "--tito-model glm47 "
         "--use-session-server "
-        "--session-server-port 30000 "
+        f"--session-server-port {args.session_server_port} "
         "--tito-allowed-append-roles user tool "
     )
 
@@ -354,6 +359,8 @@ def execute(args: ScriptArgs):
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "true",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
+        "AGENT_SERVER_AUTH_TOKEN": args.agent_server_auth_token,
+        "AGENT_SERVER_TIMEOUT_SEC": str(args.agent_server_timeout_sec),
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
         **sglang_extra_env_vars,
     }

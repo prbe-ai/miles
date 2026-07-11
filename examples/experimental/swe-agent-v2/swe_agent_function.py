@@ -40,6 +40,11 @@ async def run(
         "AGENT_MODEL_NAME",
         os.getenv("SWE_AGENT_MODEL_NAME", "model"),
     )
+    auth_token = os.getenv(
+        "AGENT_SERVER_AUTH_TOKEN",
+        os.getenv("MILES_HARBOR_AUTH_TOKEN", ""),
+    )
+    server_timeout_sec = float(os.getenv("AGENT_SERVER_TIMEOUT_SEC", "14400"))
 
     session_url = f"{base_url}/v1"
     external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
@@ -73,11 +78,15 @@ async def run(
 
     try:
         response = await asyncio.wait_for(
-            post(f"{agent_server_url}/run", request),
-            timeout=3600,  # 1 hour max per trial
+            post(
+                f"{agent_server_url}/run",
+                request,
+                headers={"Authorization": f"Bearer {auth_token}"} if auth_token else None,
+            ),
+            timeout=server_timeout_sec,
         )
     except asyncio.TimeoutError:
-        logger.error("Agent server call timed out after 3600s")
+        logger.error("Agent server call timed out after %ss", server_timeout_sec)
         return None
     except asyncio.CancelledError:
         logger.warning("Agent server call cancelled (sibling task failure?)")

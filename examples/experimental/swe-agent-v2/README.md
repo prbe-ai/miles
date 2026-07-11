@@ -1,5 +1,11 @@
 # Agent V2: Generalized Agent-Environment RL Training with Harbor
 
+> [!IMPORTANT]
+> The original standalone `server.py` and `run.sh` described below were removed
+> after their Harbor APIs drifted, so the historical setup is not runnable as
+> written. For the maintained public-Harbor bridge, local smoke test, and
+> production configuration, see [PUBLIC_HARBOR.md](PUBLIC_HARBOR.md).
+
 A unified pipeline for training agents on **mixed datasets** — SWE-bench, Terminal-Bench, custom tasks, etc. — through a single endpoint. Uses **TITO (Token In Token Out)** through SGLang's `/v1/chat/completions` for exact token-level training signals.
 
 **Agent orchestration and grading** are handled by [Harbor](https://github.com/harbor-framework/harbor). Harbor provides unified rollout + grading in a single `Trial.run()` call. The server is **task-type agnostic** — all differentiation (environment, grading harness) is encoded in each task's 4 files (instruction.md, Dockerfile, test.sh, task.toml).
