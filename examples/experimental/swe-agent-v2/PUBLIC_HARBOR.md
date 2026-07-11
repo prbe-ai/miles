@@ -167,16 +167,20 @@ does not pretend to forward that setting for Mini-SWE-Agent. Terminus supports
 the additional sampling fields mapped by the bridge.
 
 For a cloud sandbox provider, install the corresponding Harbor extra and set
-`HARBOR_ENVIRONMENT_TYPE` plus `MILES_HARBOR_ENVIRONMENT_KWARGS_JSON`. Start
-with Docker on an ordinary VM because it is closest to the validated TB2
-execution path.
+`HARBOR_ENVIRONMENT_TYPE` plus `MILES_HARBOR_ENVIRONMENT_KWARGS_JSON`. Docker
+remains the closest path for a local bridge smoke test. On a Runpod Instant
+Cluster where Docker is unavailable, use `harbor[daytona]`, set
+`HARBOR_ENVIRONMENT_TYPE=daytona`, and follow [RUNPOD_E2E.md](RUNPOD_E2E.md).
+The Runpod guide includes the separate external callback route that a Daytona
+sandbox needs to reach the Miles session server.
 
 ## Remaining validation before GPU training
 
 1. Run one Mini-SWE-Agent task against a standalone OpenAI-compatible server.
 2. Run it against a real Miles session server and confirm TITO records multiple turns.
 3. Force a small `max_seq_len` and confirm bridge cancellation/cleanup.
-4. Run 4-8 concurrent tasks and inspect Docker cleanup and Harbor artifacts.
+4. Run 4-8 concurrent tasks and inspect Docker/cloud-sandbox cleanup and
+   Harbor artifacts.
 5. Run Miles `debug_rollout_only` on one GPU node.
 6. Only then start the two-node cloud training recipe.
 
