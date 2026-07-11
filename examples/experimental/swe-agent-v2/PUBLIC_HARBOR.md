@@ -178,7 +178,10 @@ execution path.
 3. Force a small `max_seq_len` and confirm bridge cancellation/cleanup.
 4. Run 4-8 concurrent tasks and inspect Docker cleanup and Harbor artifacts.
 5. Run Miles `debug_rollout_only` on one GPU node.
-6. Only then start the two-node Runpod training recipe.
+6. Only then start the two-node cloud training recipe.
 
 For the exact GPU-node preflight, networking gates, one-rollout test, and
-training launch commands, follow [RUNPOD_E2E.md](RUNPOD_E2E.md).
+training launch commands, follow the provider guide:
+
+- [Runpod](RUNPOD_E2E.md)
+- [Crusoe](CRUSOE_E2E.md)

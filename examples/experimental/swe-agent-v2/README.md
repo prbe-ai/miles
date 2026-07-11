@@ -5,6 +5,7 @@
 > after their Harbor APIs drifted, so the historical setup is not runnable as
 > written. For the maintained public-Harbor bridge, local smoke test, and
 > production configuration, see [PUBLIC_HARBOR.md](PUBLIC_HARBOR.md).
+> Provider runbooks: [Runpod](RUNPOD_E2E.md) and [Crusoe](CRUSOE_E2E.md).
 
 A unified pipeline for training agents on **mixed datasets** — SWE-bench, Terminal-Bench, custom tasks, etc. — through a single endpoint. Uses **TITO (Token In Token Out)** through SGLang's `/v1/chat/completions` for exact token-level training signals.
 
