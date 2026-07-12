@@ -14,11 +14,39 @@ import asyncio
 import logging
 import os
 from typing import Any
-from urllib.parse import urlparse, urlsplit, urlunparse
+from urllib.parse import urlsplit, urlunsplit
 
 from miles.utils.http_utils import post
 
 logger = logging.getLogger(__name__)
+
+
+def _external_origin() -> str:
+    """Return and validate the optional public session-server origin."""
+    value = os.getenv("MILES_ROUTER_EXTERNAL_BASE_URL", "").strip().rstrip("/")
+    if not value:
+        return ""
+
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("MILES_ROUTER_EXTERNAL_BASE_URL must be an http(s) origin")
+    if parsed.username or parsed.password:
+        raise ValueError("MILES_ROUTER_EXTERNAL_BASE_URL must not contain credentials")
+    if parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("MILES_ROUTER_EXTERNAL_BASE_URL must not contain a path, query, or fragment")
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def _externalize_session_url(url: str, external_origin: str, external_host: str) -> str:
+    parsed = urlsplit(url)
+    if external_origin:
+        public = urlsplit(external_origin)
+        return urlunsplit((public.scheme, public.netloc, parsed.path, parsed.query, parsed.fragment))
+    if external_host:
+        port = parsed.port
+        netloc = f"{external_host}:{port}" if port else external_host
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    return url
 
 
 async def run(
@@ -46,19 +74,18 @@ async def run(
     )
     server_timeout_sec = float(os.getenv("AGENT_SERVER_TIMEOUT_SEC", "14400"))
 
-    session_url = f"{base_url}/v1"
+    session_url = f"{base_url.rstrip('/')}/v1"
+    external_origin = _external_origin()
     external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
-    if external_host:
-        parsed = urlparse(session_url)
-        port = parsed.port
-        netloc = f"{external_host}:{port}" if port else external_host
-        session_url = urlunparse(parsed._replace(netloc=netloc))
+    session_url = _externalize_session_url(session_url, external_origin, external_host or "")
+    session_api_key = os.getenv("MILES_SESSION_API_KEY", "")
 
     request: dict[str, Any] = {
         **metadata,
         "base_url": session_url,
         "model": f"openai/{model_name}",
         "sampling_params": request_kwargs,
+        "api_key": session_api_key or "dummy",
     }
 
     max_seq_len = metadata.get("max_seq_len")
@@ -67,7 +94,9 @@ async def run(
 
     session_server_id = metadata.get("session_server_id")
     if session_server_id is not None:
-        if external_host:
+        if external_origin:
+            session_server_id = external_origin
+        elif external_host:
             port = urlsplit(f"http://{session_server_id}").port
             session_server_id = f"{external_host}:{port}"
         request["session_server_id"] = session_server_id

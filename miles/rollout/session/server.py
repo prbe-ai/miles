@@ -6,13 +6,15 @@
 - ``run_session_server`` is the subprocess entry point: fresh interpreter, so it configures logging and the process title itself, then serves uvicorn.
 """
 
+import hmac
 import json
 import logging
 
 import httpx
 import setproctitle
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from miles.rollout.session.core import ProxyRequest
 from miles.rollout.session.sessions import setup_session_routes
@@ -21,7 +23,7 @@ from miles.utils.logging_utils import configure_logger_raw
 logger = logging.getLogger(__name__)
 
 # Request headers that must not be forwarded verbatim to the upstream backend.
-_DROP_REQUEST_HEADERS = ("content-length", "transfer-encoding", "host")
+_DROP_REQUEST_HEADERS = ("authorization", "content-length", "transfer-encoding", "host")
 
 
 class SessionServer:
@@ -31,6 +33,17 @@ class SessionServer:
     def __init__(self, args, backend_url: str):
         self.backend_url = backend_url
         self.app = FastAPI()
+
+        api_key = getattr(args, "session_server_api_key", "")
+        if api_key:
+            expected_authorization = f"Bearer {api_key}"
+
+            @self.app.middleware("http")
+            async def require_session_authorization(request: Request, call_next):
+                authorization = request.headers.get("authorization", "")
+                if not hmac.compare_digest(authorization, expected_authorization):
+                    return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+                return await call_next(request)
 
         timeout = getattr(args, "miles_router_timeout", 600.0)
         self.client = httpx.AsyncClient(
@@ -78,10 +91,12 @@ def run_session_server(args, backend_url: str):
     setproctitle.setproctitle("miles-session-server")
 
     server = SessionServer(args, backend_url)
+    bind_ip = getattr(args, "session_server_bind_ip", None) or args.session_server_ip
     logger.info(
-        "[session-server] Starting on %s:%s, proxying to %s",
-        args.session_server_ip,
+        "[session-server] Starting on %s:%s (client address %s), proxying to %s",
+        bind_ip,
         args.session_server_port,
+        args.session_server_ip,
         backend_url,
     )
-    uvicorn.run(server.app, host=args.session_server_ip, port=args.session_server_port, log_level="info")
+    uvicorn.run(server.app, host=bind_ip, port=args.session_server_port, log_level="info")

@@ -83,8 +83,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     )
     agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
     session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
+    session_server_bind_ip: str = os.environ.get("MILES_SESSION_SERVER_BIND_IP", "")
     harbor_tasks_dir: str = os.environ.get("HARBOR_TASKS_DIR", "/root/harbor_tasks")
     router_external_host: str = os.environ.get("MILES_ROUTER_EXTERNAL_HOST", "")
+    router_external_base_url: str = os.environ.get("MILES_ROUTER_EXTERNAL_BASE_URL", "")
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", "")
 
     # Disaggregated fully-async settings
@@ -289,6 +291,8 @@ def execute(args: ScriptArgs):
         f"--session-server-port {args.session_server_port} "
         "--tito-allowed-append-roles user tool "
     )
+    if args.session_server_bind_ip:
+        agent_args += f"--session-server-bind-ip {args.session_server_bind_ip} "
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -303,6 +307,7 @@ def execute(args: ScriptArgs):
         f"--rollout-num-gpus {rollout_gpus} "
         "--grad-reduce-in-bf16 "
         "--use-fault-tolerance "
+        "--pin-rollout-manager-to-head "
         f"--rollout-health-check-first-wait {args.rollout_health_check_first_wait} "
     )
     if args.accumulate_allreduce_grads_in_fp32:
@@ -366,6 +371,10 @@ def execute(args: ScriptArgs):
     }
     if args.router_external_host:
         extra_env_vars["MILES_ROUTER_EXTERNAL_HOST"] = args.router_external_host
+    if args.router_external_base_url:
+        extra_env_vars["MILES_ROUTER_EXTERNAL_BASE_URL"] = args.router_external_base_url
+    if session_api_key := os.environ.get("MILES_SESSION_API_KEY"):
+        extra_env_vars["MILES_SESSION_API_KEY"] = session_api_key
     if args.miles_host_ip:
         extra_env_vars["MILES_HOST_IP"] = args.miles_host_ip
 

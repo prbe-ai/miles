@@ -163,13 +163,14 @@ async def test_session_monitor_enforces_identity_and_token_limit(tmp_path: Path,
     request = server.RunRequest(
         base_url="http://miles.internal:30000/sessions/session-123/v1",
         model="openai/model",
+        api_key="session-secret",
         instance_id="hello-world",
         max_seq_len=3,
         session_server_id="miles.internal:30000",
         session_server_instance_id="server-generation-1",
     )
     settings = server.Settings(tasks_dir=tmp_path, session_poll_interval_sec=0.001)
-    requested_urls = []
+    requested = []
 
     class FakeClient:
         async def __aenter__(self):
@@ -178,8 +179,8 @@ async def test_session_monitor_enforces_identity_and_token_limit(tmp_path: Path,
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
-        async def get(self, url):
-            requested_urls.append(url)
+        async def get(self, url, headers=None):
+            requested.append((url, headers))
             if url.endswith("/health"):
                 return httpx.Response(
                     200,
@@ -195,7 +196,10 @@ async def test_session_monitor_enforces_identity_and_token_limit(tmp_path: Path,
     monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: FakeClient())
     observed = await server._poll_until_sequence_limit(request, settings)
     assert observed == 3
-    assert requested_urls == [
-        "http://miles.internal:30000/health",
-        "http://miles.internal:30000/sessions/session-123",
+    assert requested == [
+        ("http://miles.internal:30000/health", {"Authorization": "Bearer session-secret"}),
+        (
+            "http://miles.internal:30000/sessions/session-123",
+            {"Authorization": "Bearer session-secret"},
+        ),
     ]

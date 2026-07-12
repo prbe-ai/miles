@@ -76,6 +76,7 @@ def make_args(**overrides: Any) -> Namespace:
         use_miles_router=False,
         use_session_server=False,
         session_server_ip=None,
+        session_server_bind_ip=None,
         session_server_port=None,
         # external rollout
         rollout_external=False,

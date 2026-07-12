@@ -23,6 +23,12 @@ If a gate fails, stop and record:
 Do not reset the checkout, delete `/workspace`, terminate the cluster, or kill
 unrelated processes while diagnosing a gate.
 
+> **Non-negotiable before clicking Deploy:** select the same Runpod network
+> volume for the Instant Cluster and mount it at `/workspace`. If the volume is
+> not selected during deployment, cloning into one Pod will not populate the
+> other Pod, and normal distributed checkpointing has no shared destination.
+> Do not rent the cluster first and plan to attach storage afterward.
+
 ## 1. Understand the topology
 
 The recommended topology is:
@@ -73,8 +79,8 @@ Have these ready:
 - a Runpod account permitted to create a two-node Instant Cluster;
 - a Runpod template built from an image with CUDA, Python, `git`, `uv`, Ray,
   `openssh-client`, `rsync`, `curl`, `tmux`, and build tools;
-- a network volume in the **same Runpod data center** as the cluster, if that
-  data center supports volumes;
+- a network volume already created in the **same Runpod data center** as the
+  cluster and available for selection in the Instant Cluster form;
 - GitHub access to the Miles repository and branch containing the public
   Harbor bridge;
 - a Daytona account and `DAYTONA_API_KEY`;
@@ -84,6 +90,37 @@ Have these ready:
   checkpoint, traces, and training checkpoints;
 - for the production callback path, a small public CPU VM, a DNS name, and an
   SSH key dedicated to the reverse tunnel.
+
+Before renting GPUs, run the repository-only preflight from this checkout:
+
+```bash
+python examples/experimental/swe-agent-v2/runpod_preflight.py --phase repo
+```
+
+Require zero failures. A dirty-worktree warning is expected only while
+developing; deploy a recorded commit so both Pods run identical code.
+
+### Pre-populate the volume without renting the GPU cluster
+
+When the target data center has no S3-compatible endpoint, use a temporary,
+inexpensive CPU Pod in the **same data center**:
+
+1. Attach the future cluster's network volume at `/workspace` while creating
+   the CPU Pod.
+2. Clone the recorded Miles branch/commit into `/workspace/miles`.
+3. Download the HF checkpoint into `/workspace/models`.
+4. Use a temporary Harbor 0.18/Daytona-capable venv outside `/workspace` to
+   download/export Terminal-Bench tasks into `/workspace/harbor`, then create
+   the Miles JSONL using section 9.
+5. Record checksums or at least file counts and sizes.
+6. Terminate the CPU Pod without deleting the network volume.
+7. Select that same volume when creating the Instant Cluster.
+
+Do not build the Megatron `torch_dist` checkpoint twice. If CPU conversion is
+too slow or needs the Miles GPU image, leave only that conversion for the
+primary GPU Pod. Also avoid creating the Harbor venv on an unrelated CPU
+image; create it on the primary so its interpreter and native dependencies
+match the Runpod template image.
 
 Harbor documents Daytona as a supported cloud-sandbox path in its
 [getting-started guide][harbor-getting-started].
@@ -106,7 +143,7 @@ HF_TOKEN
 WANDB_API_KEY
 GITHUB_TOKEN                 # only if the checkout is private
 AGENT_SERVER_AUTH_TOKEN
-MILES_SESSION_API_KEY        # required by the production relay design
+MILES_SESSION_API_KEY        # required for direct and relay callbacks
 ```
 
 The Daytona key is only required on the host running
@@ -123,10 +160,18 @@ Instant Cluster. See Runpod's [template documentation][runpod-templates] and
 
 ### Image and storage
 
-- Use the Miles-compatible CUDA/PyTorch image selected for the experiment.
-- Give the container disk enough room for packages and temporary compilation.
-- Mount the network volume at `/workspace` if the Instant Cluster deployment
-  UI offers the volume.
+- Use `radixark/miles:latest` as the Runpod template image. It already contains
+  the patched SGLang, Megatron-LM, Ray, CUDA kernels, and Miles dependency tree
+  that are difficult to reproduce correctly from a generic PyTorch image.
+- Allocate at least 100 GB of container disk for the image, Python packages,
+  caches, and temporary compilation. The node preflight requires at least
+  20 GiB still free before launch.
+- Select the network volume in the Instant Cluster creation form and mount it
+  at `/workspace` on every node.
+- Size the network volume for the HF model, converted checkpoint, datasets,
+  traces, and multiple training checkpoints. The checked-in preflight defaults
+  to requiring 300 GiB free; 500 GB or more is a safer starting allocation for
+  this experiment.
 - Keep repositories, datasets, models, checkpoints, traces, and durable logs
   under `/workspace`.
 - Do not rely on files elsewhere in the container surviving a Pod edit or
@@ -138,6 +183,19 @@ placement, persistence, and transfer options.
 If the India data center does not expose the S3-compatible volume API, that is
 not fatal. Attach the volume first, then populate `/workspace` from a running
 Pod using `git`, Hugging Face download tools, `scp`, or resumable `rsync`.
+If the Instant Cluster form does not offer the volume, do not deploy: the
+volume and GPUs are not in a compatible data center or the selected capacity
+cannot use that storage.
+
+The volume is shared, so perform repository updates, package installation,
+model downloads, and checkpoint conversion from the primary only. Do not run
+two `git pull`, `uv pip install`, or conversion processes against the same
+paths concurrently. Distributed checkpoint writers may use the shared
+destination only through Miles/Megatron's coordinated rank-aware save path.
+
+The image contains `/root/miles`, but the experiment must use the branch cloned
+at `/workspace/miles`. After cloning, install that checkout editable with
+`--no-deps`; do not reinstall the full Miles requirements over the image.
 
 ### Ports
 
@@ -172,9 +230,14 @@ AGENT_MAX_CONCURRENT=2
 AGENT_SERVER_TIMEOUT_SEC=14400
 MILES_HARBOR_REQUEST_TIMEOUT_SEC=14400
 MILES_SCRIPT_EXTERNAL_RAY=1
+MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 MILES_ROOT=/workspace/miles
 HARBOR_DATA_ROOT=/workspace/harbor
 ```
+
+The same copy-ready values are checked in as
+`runpod-template.env.example`. The file deliberately cannot select storage;
+the network volume must still be chosen in the Instant Cluster form.
 
 Do **not** set these in the template; Runpod generates them separately for
 each cluster deployment or Pod:
@@ -193,8 +256,9 @@ RUNPOD_TCP_PORT_70000
 RUNPOD_VOLUME_ID
 ```
 
-Do not bake `MILES_ROUTER_EXTERNAL_HOST`, `MILES_SESSION_SERVER_PORT`, or a
-relay URL into the template. Derive callback values after every deployment.
+Do not bake `MILES_ROUTER_EXTERNAL_HOST`, `MILES_ROUTER_EXTERNAL_BASE_URL`,
+`MILES_SESSION_SERVER_PORT`, or a relay URL into the template. Derive callback
+values after every deployment.
 
 ### Startup command
 
@@ -312,7 +376,9 @@ restarting them.
 
 ## 6. Verify the checkout and install isolated Harbor dependencies
 
-Run on the primary, and repeat on the worker if the checkout is not shared:
+Run the Git inspection on the primary. Run the runtime checks and editable
+install on both Pods, one Pod at a time. Although the source checkout is
+shared, each Pod has its own Python site-packages:
 
 ```bash
 set -euo pipefail
@@ -329,35 +395,48 @@ nvidia-smi
 python --version
 ray --version
 uv --version
+
+pip install -e "$MILES_ROOT" --no-deps
 ```
 
 The checkout must contain the public bridge. Do not silently switch to an
 older `main` checkout containing only `harbor-private` instructions.
 
-Install Harbor in a separate Python 3.12 venv. The Daytona extra is required;
-the base requirements file alone does not install the Daytona SDK.
+Install Harbor in a separate Python 3.12 venv using the Runpod requirements,
+which include the Daytona SDK.
 
 ```bash
 export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
 uv venv "$HARBOR_VENV" --python 3.12
 uv pip install --python "$HARBOR_VENV/bin/python" \
-  -r examples/experimental/swe-agent-v2/requirements-public-harbor-server.txt \
-  'harbor[daytona]==0.18.0' pytest pytest-asyncio ruff
+  -r examples/experimental/swe-agent-v2/requirements-runpod.txt \
+  pytest pytest-asyncio ruff
 
 "$HARBOR_VENV/bin/harbor" --version
 "$HARBOR_VENV/bin/python" -m pytest -q \
-  tests/fast/experimental/test_public_harbor_server.py \
+  tests/fast/experimental \
   --confcutdir=tests/fast/experimental \
   --override-ini='addopts='
 ```
 
 Require Harbor `0.18.0` and all bridge contract tests to pass.
 
+Run the node preflight on **both** Pods after setting any available paths:
+
+```bash
+python examples/experimental/swe-agent-v2/runpod_preflight.py \
+  --phase node \
+  --callback-mode direct
+```
+
+This proves that each Pod has a network volume attached. It cannot prove that
+both Pods see the same volume contents; the sentinel-file test in section 5
+remains mandatory.
+
 ## 7. Repository compatibility gate
 
-The cloud callback must always terminate on the primary. Before spending time
-on a real rollout, a coding agent must verify the checkout provides all of the
-following:
+The cloud callback must always terminate on the primary. This branch now
+provides all of the following:
 
 1. Both SWE-agent launchers pass `--pin-rollout-manager-to-head` to Miles.
 2. The session server can listen on `0.0.0.0` without replacing the internal
@@ -378,20 +457,15 @@ Relevant files are:
 - `miles/ray/rollout/router_manager.py`
 - `miles/rollout/session/server.py`
 
-At the time this runbook was updated, the repository state was:
+Repository state:
 
-| Capability | Current state | Required work |
+| Capability | Current state | Verification |
 | --- | --- | --- |
-| Pin RolloutManager to Ray head | Core `--pin-rollout-manager-to-head` flag exists | Add it to the argument strings generated by both SWE-agent launchers |
-| Listen publicly while retaining a private session address | One `session_server_ip` is used for both binding and internal clients | Add a separate bind host, normally `0.0.0.0`, while retaining `PRIMARY_ADDR`/the router IP for internal clients |
-| Advertise relay HTTPS URL | `swe_agent_function.py` rewrites only the hostname and preserves scheme/port | Add a full external origin/base-URL setting and preserve only `/sessions/<id>/v1` from the internal URL |
-| Authenticate the bridge | Implemented with `AGENT_SERVER_AUTH_TOKEN` | Keep using it for Miles-to-bridge calls |
-| Authenticate the public session callback | Not implemented end to end | Pass a session bearer token to the Daytona OpenAI client and the bridge monitor; enforce it at the relay |
-
-The direct-TCP smoke is blocked until head pinning and a safe external bind are
-implemented. The production relay is additionally blocked on full external
-base-URL and session-token propagation. Treat these as implementation tasks,
-not environment-variable problems.
+| Pin RolloutManager to Ray head | Both launchers pass `--pin-rollout-manager-to-head` | Repository preflight inspects both launchers |
+| Listen publicly while retaining a private session address | `session_server_bind_ip` is separate from `session_server_ip` | Router-manager test plus external callback probe |
+| Advertise relay HTTPS URL | `MILES_ROUTER_EXTERNAL_BASE_URL` replaces the external origin while preserving the session path | Agent-function contract tests |
+| Authenticate the bridge | `AGENT_SERVER_AUTH_TOKEN` protects Miles-to-bridge calls | Public-Harbor HTTP contract test |
+| Authenticate the public session callback | `MILES_SESSION_API_KEY` reaches Miles internal clients, Daytona, and the Harbor monitor; Miles enforces it | Session-auth and agent-function contract tests |
 
 Implementation acceptance criteria:
 
@@ -405,14 +479,9 @@ Implementation acceptance criteria:
   `--pin-rollout-manager-to-head`.
 - The existing fast tests still pass before any GPU smoke test.
 
-The core Miles flag already exists in `miles/utils/arguments.py`. The launchers
-must actually include it in their generated training arguments. Without head
-pinning, the RolloutManager and session server can be placed on the worker,
-while the advertised public callback still points at the primary.
-
-For direct TCP, a temporary checkout may use the existing host-only callback
-rewrite only when the external and internal ports are symmetrical. For the
-stable relay, full external URL support is mandatory.
+Run the repository preflight and dependency-light contract suite before
+deployment. The Ray-specific router-manager test additionally runs in the
+Runpod/Miles environment, which contains Ray.
 
 Do not claim the production path is complete merely because an oracle trial
 passes: the oracle does not call the Miles model endpoint.
@@ -558,7 +627,9 @@ test "$NODE_RANK" = "0"
 
 export CALLBACK_HOST="$RUNPOD_PUBLIC_IP"
 export MILES_SESSION_SERVER_PORT="$RUNPOD_TCP_PORT_70000"
+export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 export MILES_ROUTER_EXTERNAL_HOST="$CALLBACK_HOST"
+export MILES_SESSION_API_KEY="${MILES_SESSION_API_KEY:-$(openssl rand -hex 32)}"
 
 echo "Direct callback: http://${CALLBACK_HOST}:${MILES_SESSION_SERVER_PORT}"
 ```
@@ -595,9 +666,9 @@ port mappings whenever a Pod resets. Re-read both Runpod variables and rerun
 the probe after every reset. Never reuse a callback copied from an earlier
 cluster.
 
-This option is for integration testing. It exposes model requests and task
-content over unauthenticated plain HTTP unless the repository compatibility
-work adds protection.
+This option is for integration testing. Miles requires the configured bearer,
+but traffic remains plain HTTP and can be observed in transit. Do not use it
+for sensitive or long-running training.
 
 ### Option B: stable authenticated relay for training
 
@@ -610,6 +681,7 @@ The primary initiates and maintains a reverse tunnel similar to:
 ```bash
 export INTERNAL_SESSION_PORT=30000
 export MILES_SESSION_SERVER_PORT="$INTERNAL_SESSION_PORT"
+export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 export RELAY_HOST=miles-relay.example.com
 export RELAY_USER=miles-relay
 
@@ -630,8 +702,7 @@ to port forwarding. Configure Caddy, Nginx, or an equivalent relay service to:
 - limit request size/rate and log failures without logging the bearer token;
 - expose no relay admin interface publicly.
 
-Set the bridge callback allowlist to the relay hostname. Once full external
-base-URL support is implemented, advertise:
+Set the bridge callback allowlist to the relay hostname and advertise:
 
 ```bash
 export MILES_ROUTER_EXTERNAL_BASE_URL=https://miles-model.example.com
@@ -760,15 +831,22 @@ export RAY_ADDRESS=http://127.0.0.1:8265
 export AGENT_SERVER_TIMEOUT_SEC=14400
 export AGENT_MODEL_NAME=model
 export MILES_HOST_IP="$PRIMARY_ADDR"
+export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 
 : "${AGENT_SERVER_URL:?start the bridge}"
 : "${AGENT_SERVER_AUTH_TOKEN:?set bridge auth}"
 : "${TB2_SMOKE_JSONL:?create the smoke JSONL}"
 : "${MILES_SESSION_SERVER_PORT:?set callback/internal session port}"
+
+if [[ -n "${MILES_ROUTER_EXTERNAL_BASE_URL:-}" ]]; then
+  CALLBACK_ARGS=(--router-external-base-url "$MILES_ROUTER_EXTERNAL_BASE_URL")
+else
+  CALLBACK_ARGS=(--router-external-host "$CALLBACK_HOST")
+fi
 ```
 
-After the repository compatibility gate passes, launch exactly one rollout
-without a training update:
+After the repository preflight and contract tests pass, launch exactly one
+rollout without a training update:
 
 ```bash
 cd "$MILES_ROOT"
@@ -790,12 +868,14 @@ python examples/experimental/swe-agent-v2/run.py \
   --agent-server-auth-token "$AGENT_SERVER_AUTH_TOKEN" \
   --agent-server-timeout-sec 14400 \
   --session-server-port "$MILES_SESSION_SERVER_PORT" \
-  --router-external-host "$CALLBACK_HOST" \
+  --session-server-bind-ip "$MILES_SESSION_SERVER_BIND_IP" \
+  "${CALLBACK_ARGS[@]}" \
   --miles-host-ip "$PRIMARY_ADDR"
 ```
 
-For the relay path, use the launcher's full external-base-URL option added by
-the compatibility work instead of `--router-external-host`.
+The callback argument array selects the full relay origin when set and
+otherwise uses the direct callback host. Do not set both callback variables
+manually.
 
 Monitor from a second primary terminal:
 
@@ -835,6 +915,12 @@ Run one fully async rollout using one training node and one rollout node:
 ```bash
 export DEBUG_SAVE=/workspace/runs/runpod-public-harbor-async-debug
 
+if [[ -n "${MILES_ROUTER_EXTERNAL_BASE_URL:-}" ]]; then
+  CALLBACK_ARGS=(--router-external-base-url "$MILES_ROUTER_EXTERNAL_BASE_URL")
+else
+  CALLBACK_ARGS=(--router-external-host "$CALLBACK_HOST")
+fi
+
 python examples/experimental/swe-agent-v2/run-glm47-flash-agentic-async.py \
   --mode debug_rollout_only \
   --num-nodes 2 --train-num-nodes 1 --num-gpus-per-node "$NUM_TRAINERS" \
@@ -856,7 +942,8 @@ python examples/experimental/swe-agent-v2/run-glm47-flash-agentic-async.py \
   --agent-server-auth-token "$AGENT_SERVER_AUTH_TOKEN" \
   --agent-server-timeout-sec 14400 \
   --session-server-port "$MILES_SESSION_SERVER_PORT" \
-  --router-external-host "$CALLBACK_HOST" \
+  --session-server-bind-ip "$MILES_SESSION_SERVER_BIND_IP" \
+  "${CALLBACK_ARGS[@]}" \
   --miles-host-ip "$PRIMARY_ADDR"
 ```
 
@@ -866,7 +953,7 @@ actual two-Pod topology.
 
 ## 15. Launch training
 
-Do not run this with the unauthenticated direct-TCP callback. Establish the
+Do not run this with the plain-HTTP direct-TCP callback. Establish the
 TLS/authenticated relay and rerun the one- and two-node smoke gates through the
 relay first.
 
@@ -897,14 +984,13 @@ python examples/experimental/swe-agent-v2/run-glm47-flash-agentic-async.py \
   --agent-server-auth-token "$AGENT_SERVER_AUTH_TOKEN" \
   --agent-server-timeout-sec 14400 \
   --session-server-port "$MILES_SESSION_SERVER_PORT" \
+  --session-server-bind-ip "$MILES_SESSION_SERVER_BIND_IP" \
+  --router-external-base-url "$MILES_ROUTER_EXTERNAL_BASE_URL" \
   --miles-host-ip "$PRIMARY_ADDR" \
   --wandb-project glm47-flash-agentic-async \
   --wandb-run-name "$RUN_TAG" \
   2>&1 | tee "$RUN_ROOT/launcher.log"
 ```
-
-Add the full external relay URL using the launcher option introduced by the
-repository compatibility work.
 
 Do not leave the first iteration unattended. Require:
 
@@ -993,7 +1079,7 @@ up or verify checkpoints before terminating the Instant Cluster.
 | Agent gets connection refused | Re-run the external callback probe and confirm the session server is on the primary and listening correctly. |
 | Agent gets `/sessions/...` 404 | The advertised URL reached the wrong or restarted session server; stop the run. |
 | Session-server identity changes | The server restarted or traffic hit a different node; stop rather than mixing records. |
-| RolloutManager appears on the worker | The launcher did not apply `--pin-rollout-manager-to-head`; fix the compatibility gate. |
+| RolloutManager appears on the worker | Stop: the wrong revision ran or Ray head identification is inconsistent; capture the generated command and Ray node state. |
 | Ray sees fewer GPUs than `WORLD_SIZE` | Fix Ray membership or node addresses before launching Miles. |
 | NCCL connects over `eth0` or times out | Set `NCCL_SOCKET_IFNAME=ens1` and restart the affected job. |
 | SGLang OOMs | Clean stale GPU processes and lower memory/batch settings before changing topology. |

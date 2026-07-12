@@ -2025,7 +2025,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--session-server-ip",
                 type=str,
                 default=None,
-                help="IP address of the standalone session server. Defaults to sglang-router-ip.",
+                help=(
+                    "Routable IP address used by Miles clients for the standalone session server. "
+                    "Defaults to sglang-router-ip."
+                ),
+            )
+            parser.add_argument(
+                "--session-server-bind-ip",
+                type=str,
+                default=None,
+                help=(
+                    "Listen address for the standalone session server. Defaults to session-server-ip. "
+                    "Set to 0.0.0.0 when the server must also accept traffic forwarded from outside the node."
+                ),
             )
             parser.add_argument(
                 "--session-server-port",

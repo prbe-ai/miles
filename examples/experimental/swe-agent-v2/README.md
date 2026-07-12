@@ -266,7 +266,10 @@ Then open `http://<host>:8081` in a browser.
 | `AGENT_MODEL_NAME` | `model` | Model name passed to agents |
 | `AGENT_MAX_CONCURRENT` | `8` | Max concurrent Harbor trials |
 | `HARBOR_TASKS_DIR` | `/root/harbor_tasks` | Root directory containing task subdirectories |
-| `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Hostname for agent containers to reach Miles Router |
+| `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Legacy/direct-TCP callback host; preserves the internal scheme and port |
+| `MILES_ROUTER_EXTERNAL_BASE_URL` | empty | Complete external callback origin, such as `https://miles-model.example.com`; takes precedence over host-only rewriting |
+| `MILES_SESSION_SERVER_BIND_IP` | private session address | Optional listen-address override; Runpod sets `0.0.0.0` separately from Miles' private client address |
+| `MILES_SESSION_API_KEY` | empty | Bearer secret enforced by the Miles session server and forwarded to Harbor agents/monitoring |
 | `MILES_HOST_IP` | `$(hostname)` | IP/hostname for inter-container communication |
 
 ### Model-specific arguments

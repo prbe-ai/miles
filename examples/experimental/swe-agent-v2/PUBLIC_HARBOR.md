@@ -153,6 +153,7 @@ export HARBOR_DELETE_ENVIRONMENTS=true
 export AGENT_MAX_CONCURRENT=8
 export MILES_HARBOR_AUTH_TOKEN='<random-secret>'
 export AGENT_SERVER_AUTH_TOKEN="$MILES_HARBOR_AUTH_TOKEN"
+export MILES_SESSION_API_KEY='<separate-random-secret>'
 export MILES_HARBOR_ALLOWED_CALLBACK_HOSTS='<Miles callback hostname>'
 ```
 
@@ -160,6 +161,9 @@ The same `AGENT_SERVER_AUTH_TOKEN` must be present in the Miles Ray runtime.
 The checked-in synchronous and GLM-4.7-Flash async launchers now propagate it.
 They also default `AGENT_SERVER_TIMEOUT_SEC` to four hours so a valid long
 Terminal-Bench trial is not cut off by the client after exactly one hour.
+`MILES_SESSION_API_KEY` is a separate credential for the model/session
+callback. The launchers propagate it to the Miles session server, Daytona
+agent, and Harbor session monitor; do not reuse the bridge credential.
 
 Public Harbor 0.18.0's Mini-SWE-Agent adapter accepts `max_tokens` and
 `reasoning_effort`, but not a per-trial `temperature`; the bridge therefore

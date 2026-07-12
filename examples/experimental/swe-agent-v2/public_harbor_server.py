@@ -267,9 +267,10 @@ async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) ->
 
     server_url = _session_server_url(request.session_server_id)
     timeout = httpx.Timeout(30.0, connect=10.0)
+    headers = {"Authorization": f"Bearer {request.api_key}"} if request.api_key else None
     async with httpx.AsyncClient(timeout=timeout) as client:
         if request.session_server_instance_id:
-            health = await client.get(f"{server_url}/health")
+            health = await client.get(f"{server_url}/health", headers=headers)
             health.raise_for_status()
             actual_id = health.json().get("session_server_instance_id")
             if actual_id != request.session_server_instance_id:
@@ -277,7 +278,7 @@ async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) ->
 
         while True:
             try:
-                response = await client.get(f"{server_url}/sessions/{session_id}")
+                response = await client.get(f"{server_url}/sessions/{session_id}", headers=headers)
                 response.raise_for_status()
                 token_ids = response.json().get("metadata", {}).get("accumulated_token_ids", [])
                 token_count = len(token_ids) if isinstance(token_ids, list) else 0
