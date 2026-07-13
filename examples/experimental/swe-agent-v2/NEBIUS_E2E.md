@@ -33,6 +33,12 @@ Do not start normal training until all of these pass in order:
 7. one fully async two-node rollout; and
 8. the authenticated TLS callback test.
 
+These gates describe the original cluster, distributed-runtime, Harbor, and
+rollout-validation scope. A policy/weight update was added later as a separate
+training smoke test. Do not treat a successful rollout-only run as proof that
+the training model, gradient buffers, optimizer state, and inference model fit
+in the selected GPU partition.
+
 ## 1. Architecture and important differences from Runpod
 
 ```text
@@ -355,6 +361,88 @@ kubectl get nodes -o wide --watch
 ```
 
 Require two `Ready` GPU nodes before continuing.
+
+### Operate the cluster with a coding agent
+
+Kubernetes does not provide a general login shell for the cluster. The
+recommended operating model is to run the coding agent on the operator
+machine, in the Miles checkout, and let it control the remote GPU workloads
+through the local `kubectl` context:
+
+```text
+coding agent on operator machine
+  -> local Nebius profile and kubeconfig
+  -> Kubernetes API
+     -> miles-head Pod on GPU node A
+     -> miles-worker Pod on GPU node B
+```
+
+This keeps the Nebius login and powerful Kubernetes credentials outside the
+workload Pods. It also lets the agent apply manifests, inspect both Pods, copy
+files, collect logs, and execute GPU commands without SSH access to either
+node. Before starting the agent, verify the active target and permissions:
+
+```bash
+kubectl config current-context
+kubectl cluster-info
+kubectl get nodes -o wide
+kubectl get pods --all-namespaces
+kubectl auth can-i get pods --all-namespaces
+```
+
+The local `kubectl` client must be within one minor version of the MK8S
+control-plane version. Do not continue with an unsupported client/server
+version combination.
+
+Start the coding agent from the checked-out branch containing this runbook and
+give it a bounded instruction such as:
+
+```text
+Follow examples/experimental/swe-agent-v2/NEBIUS_E2E.md starting at
+section 8. Operate the Nebius cluster through kubectl. Stop and report if the
+node, GPU, InfiniBand/NCCL, shared-filesystem, Harbor, or rollout gate does not
+match the documented expectation. Do not create, rotate, print, or delete
+credentials, and do not tear down infrastructure without explicit approval.
+```
+
+Typical remote operations performed by that local agent are:
+
+```bash
+kubectl exec -n miles miles-head -- nvidia-smi
+kubectl exec -n miles miles-worker -- nvidia-smi
+kubectl logs -n miles miles-head
+kubectl get events -n miles --sort-by=.lastTimestamp
+```
+
+The `miles-head` and `miles-worker` Pods do not exist until section 11. After
+they are deployed, an interactive coding-agent CLI may instead run directly
+inside the head Pod:
+
+```bash
+kubectl wait --for=condition=Ready pod/miles-head \
+  -n miles --timeout=15m
+kubectl exec -it -n miles miles-head -- bash
+
+cd /workspace/miles
+<launch the selected coding-agent CLI>
+```
+
+Running the agent in `miles-head` gives it direct access to the GPU runtime
+and the shared `/workspace`. Source edits under `/workspace` are visible to
+the worker, but each Pod still has its own Python environment, so section 13
+installs the shared checkout editable in both Pods.
+
+An in-Pod agent does **not** automatically have permission to apply Kubernetes
+resources or execute into the worker. Do not copy an administrator kubeconfig
+into the Pod or grant it `cluster-admin`. If the in-Pod agent truly needs to
+control Kubernetes, create and review a dedicated service account with only
+the required verbs and resources in the `miles` namespace. Otherwise, keep
+cluster-wide orchestration in the local agent and use the in-Pod agent only
+for repository, runtime, Harbor, Ray, and training work.
+
+Do not rely on a foreground `kubectl exec` session for a long training run.
+Use the Ray job submission flow in section 18 so the job continues if the
+operator terminal or coding-agent session disconnects.
 
 ## 8. Prove GPU and InfiniBand health first
 
@@ -1006,6 +1094,33 @@ Do not leave the first iteration unattended. Require the first rollout, GRPO
 step 0, trace write, and checkpoint write before increasing Daytona
 concurrency above one.
 
+### Training-memory constraint observed on H100 80 GB
+
+The later one-update smoke test split the two-node cluster into one 8-GPU
+training node and one 8-GPU inference node. With GLM-4.7-Flash training set to
+tensor parallel 4, expert parallel 2, and data parallel 2, each training GPU
+already held approximately 57.83 GiB when Megatron tried to allocate its
+parameter/gradient buffer. Only 21.34 GiB remained, while the next allocation
+required 26.44 GiB, so initialization failed before generation or an optimizer
+step. CPU optimizer offload did not remove this GPU-resident gradient-buffer
+requirement.
+
+This was not a Nebius node-size, Kubernetes cgroup, quota, or credit failure:
+the Pods had the intended 120 CPUs, 1400 GiB RAM, and eight H100s. It was a
+model-parallel layout that did not fit in 80 GiB per training GPU. Before
+retrying a policy update, validate one of these changes in isolation:
+
+- increase training tensor parallelism from 4 to 8 and adjust expert/data
+  parallelism so the world-size and batch divisibility constraints still hold;
+- reduce model, sequence, microbatch, or retained activation requirements;
+- use a memory-reducing distributed strategy whose checkpoint conversion is
+  compatible with this model; or
+- add training GPUs/nodes and recompute the parallelism topology.
+
+Megatron also required the global batch size to be divisible by microbatch size
+times data-parallel size. In the observed DP=2 layout, `global_batch_size=1`
+failed validation; changing it to 2 exposed the subsequent gradient-buffer OOM.
+
 ## 19. Failure decisions
 
 | Symptom | Action |
@@ -1026,6 +1141,8 @@ concurrency above one.
 | Callback returns a session 404/identity mismatch | Stop: traffic reached the wrong or restarted session server. |
 | Shared filesystem is slow | Benchmark it and revisit filesystem size/type; do not assume capacity alone implies required bandwidth. |
 | Head Pod restarts | Treat the training job/session state as interrupted; do not silently continue mixed rollouts. |
+| Megatron rejects global batch divisibility | Make global batch size divisible by microbatch size times data-parallel size; do not change GPU resources to fix an arithmetic constraint. |
+| Training initialization OOMs while inference fits | Recalculate TP/EP/DP and gradient/optimizer memory independently from rollout memory; the observed TP=4, EP=2, DP=2 layout needed a 26.44 GiB allocation with only 21.34 GiB free per H100. |
 
 ## 20. Stop and tear down safely
 
@@ -1092,7 +1209,163 @@ non-surge update strategy before the first node-group upgrade.
 Do not create the H100 node group until items 1-8 are known. Items 9-13 must be
 resolved before the real rollout/training gates.
 
-## Official Nebius references
+## 22. Known-good Nebius validation snapshot (2026-07-13)
+
+The following state was validated end to end and is a useful baseline for a
+new coding agent. IDs are project-specific; resolve them again rather than
+copying them into a new project.
+
+```text
+project:       project-e00k7pwtpr00cv6jdxkrxb
+region:        eu-north1
+MK8S cluster:  mk8scluster-e00hqgby0p1dtsvyzp
+GPU cluster:   computegpucluster-e00kga31xmnqr04909 (fabric-3)
+node group:    mk8snodegroup-e00phqhzyz337r0scj (2 x 8gpu-128vcpu-1600gb)
+filesystem:    computefilesystem-e00kmzw35erg3cz659 (1 TiB, filesystem-i8)
+PVC:           miles/miles-workspace (RWX, mounted at /workspace)
+```
+
+The durable development Deployment is `miles/miles-dev`, with `Recreate`
+strategy and these effective resources on its sole Pod:
+
+```yaml
+requests:
+  cpu: "120"
+  memory: 1400Gi
+  nvidia.com/gpu: "8"
+limits:
+  cpu: "120"
+  memory: 1400Gi
+  nvidia.com/gpu: "8"
+```
+
+It is privileged only because this controlled training Pod needs the exposed
+RDMA devices, and it mounts a 256 GiB memory-backed `/dev/shm`. The same
+resource shape was used for the temporary `miles-worker-validation` Pod on the
+second node. Keep the second Pod under a reviewed Deployment/Job for a real
+run; the validation Pod is intentionally disposable.
+
+Reconfirm the state before a run:
+
+```bash
+kubectl --context nebius-miles get nodes -o wide
+kubectl --context nebius-miles get pods -n miles -o wide
+kubectl --context nebius-miles get pvc -n miles
+kubectl --context nebius-miles exec -n miles deployment/miles-dev -- nvidia-smi -L
+kubectl --context nebius-miles exec -n miles deployment/miles-dev -- df -h /workspace /dev/shm
+```
+
+The successful gates were: repository preflight and 18 experimental contract
+tests; eight-GPU CUDA and single-node NCCL; a two-node `/workspace` sentinel;
+two-node NCCL with `WORLD_SIZE=16` and approximately 415 GB/s bus bandwidth;
+two-node Ray with eight GPU actors on each Pod; and one authenticated Daytona
+Harbor oracle returning `Submitted` with reward `1.0`. The GLM-4.7-Flash HF
+checkpoint and `torch_dist` conversion were staged under `/workspace/models`.
+
+A later `debug_rollout_only` attempt loaded GLM-4.7-Flash in SGLang across
+eight H100s, launched the Miles router and session server, selected two
+Terminal-Bench 2 tasks (`cobol-modernization` and `path-tracing-reverse`), and
+created both Daytona sandboxes. This verified the real callback/task path
+through sandbox agent launch, but the run was stopped before either complete
+trajectory returned. A separate normal-mode attempt reached Megatron model
+initialization but did not complete a generation or policy update because of
+the training-memory constraint documented in section 18.
+
+If a node returns `NotEnoughResources`, inspect the capacity advisor before
+changing Kubernetes resources. The error occurs before the node joins MK8S;
+do not lower the Pod limits or mix fabrics for a distributed NCCL run. A new
+GPU cluster and node group on another fabric is a migration option only when
+that fabric reports capacity for both nodes.
+
+## 23. Research OS instrumentation and Harbor artifact capture
+
+Research OS is installed with the SDK-first CLI (`exp` 0.1.0, package 0.4.0)
+and the `research-os` Claude plugin. Writes use the authenticated `exp` CLI or
+SDK; reads use the plugin's hosted MCP. Keep the write PAT and read-only MCP
+PAT in environment/configuration only; never put either in this file, shell
+history, logs, or run metadata.
+
+The SDK gives an MLflow/W&B-like lifecycle:
+
+```python
+from ros.sdk.client import Client
+
+with Client() as ros:
+    run = ros.run(
+        project="miles-nebius",
+        experiment="swe-agent-v2-nebius",
+        hypothesis="A full-resource two-node H100 MK8S deployment can pass the Harbor oracle and distributed communication gates.",
+        name="nebius-e2e-<utc-timestamp>",
+        external_id="nebius-e2e-<stable-id>",
+        tags=["nebius", "mk8s", "h100", "harbor", "daytona"],
+    )
+    run.snapshot(cwd="/workspace/miles", include_env=True, include_gpu=True)
+    run.log({"nccl_bus_gbps": 414.57, "harbor_reward": 1.0}, step=0,
+            kind="validation")
+    run.log({"gpu_count": 8, "node_count": 2}, kind="hardware")
+    run.log_artifact("harbor-trial.tar.gz", path="/path/to/harbor-trial.tar.gz",
+                     kind="sandbox_artifact")
+    run.link(nebius_cluster="<cluster-id>", node_group="<node-group-id>",
+             gpu_cluster="<gpu-cluster-id>")
+    run.finish("completed", summary={"callback_rollout": "not_run"})
+```
+
+The CLI equivalents are `exp run start`, `exp snapshot RUN`, `exp log RUN
+key=value`, `exp artifact add RUN PATH`, `exp note add RUN`, `exp link RUN
+--set key=value`, and `exp run end RUN`. Use `exp run check RUN` before
+handoff; it reports missing execution records, code snapshots, or portable
+artifact bytes.
+
+Harbor's `HARBOR_DELETE_ENVIRONMENTS=true` correctly cleaned the Daytona
+sandbox after the oracle. That means the durable upload is the collected
+trial bundle (`agent/oracle.txt`, `result.json`, verifier output, config/lock,
+and manifest), not the original sandbox filesystem. If a future run requires
+reproducible sandbox inspection, set deletion off only for a bounded debug
+trial, collect the sandbox directory explicitly, and delete it after the
+upload. Uploading a directory requires archiving it first; `log_artifact`
+uploads bytes when given a file path and otherwise records only a reference.
+
+Verified Research OS behavior after the 2026-07-13 agent and service fixes:
+
+- a Harbor execution log uploaded through the presign/PUT/confirm flow as a
+  complete, non-reference artifact and downloaded byte-for-byte with the same
+  SHA-256;
+- `run.snapshot()` created a content-addressed execution record containing
+  code, dependencies, hardware, paths, and settings;
+- the run's top-level `env_ref` persisted through `RunPatch` and resolved back
+  to that execution record; and
+- research notes and final run status/summary persisted normally.
+
+Research OS agent PR #13 fixed forwarding server-provided artifact upload
+headers and added `env_ref` persistence verification. The service-side
+presigning and `RunPatch.env_ref` fixes must also be deployed; an updated agent
+alone is insufficient against an older service.
+
+Remaining instrumentation considerations:
+
+1. The model callback has no stable HTTPS origin in the base MK8S deployment;
+   Harbor can pass its oracle while a real agent turn still cannot call Miles.
+2. A single high-level `snapshot` captures code, dependencies, GPU metadata,
+   and an execution record, but not Kubernetes YAML, Pod events, NCCL logs, or
+   Daytona sandbox contents. Add those as explicit files and link the cluster,
+   node-group, GPU-cluster, Pod, and filesystem IDs.
+3. The hosted MCP health endpoint is reachable, but a direct streamable-HTTP
+   probe returned `Session not found` on `tools/list`; restart Claude Code so
+   the plugin loads its `.mcp.json`, then verify the `research_*` tools from
+   inside Claude. Continue using the SDK/CLI for writes.
+4. Metric points are append-only and dimensions are bounded labels. Log
+   per-rank/per-node metrics with dimensions rather than emitting thousands of
+   unique keys, and flush/finish the run even after a failed rollout.
+5. Research OS artifact upload is content-addressed and remote, but large
+   checkpoints and full filesystem trees should remain on the durable PVC;
+   upload manifests, logs, trial bundles, and checksums rather than copying
+   hundreds of gigabytes into the tracker.
+6. The artifact presign flow currently stores uploaded bytes as kind `file`;
+   requested artifact `kind` and `meta` are not carried through that backend
+   flow yet. Put semantic type and lineage in the run notes/manifest until the
+   upload API accepts those fields.
+
+## Official references
 
 - [GPU node groups with InfiniBand](https://docs.nebius.com/kubernetes/gpu/clusters)
 - [Official two-node NCCL tutorial](https://docs.nebius.com/kubernetes/gpu/nccl-test)
@@ -1106,4 +1379,6 @@ resolved before the real rollout/training gates.
 - [Capacity advisor](https://docs.nebius.com/compute/virtual-machines/capacity-advisor)
 - [Compute/GPU/storage/InfiniBand quotas](https://docs.nebius.com/compute/resources/quotas-limits)
 - [Nebius CLI profile configuration](https://docs.nebius.com/cli/configure)
+- [Connect to MK8S with kubectl](https://docs.nebius.com/kubernetes/connect)
 - [Supported Kubernetes versions](https://docs.nebius.com/kubernetes/versions)
+- [Kubernetes kubectl version-skew policy](https://kubernetes.io/releases/version-skew-policy/#kubectl)
