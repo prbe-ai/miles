@@ -22,7 +22,7 @@ The target configuration is `gpu-h100-sxm` / `8gpu-128vcpu-1600gb` in
 more regions, but changing GPU platform must be treated as a separate capacity
 and performance decision.
 
-Do not start normal training until all of these pass in order:
+Complete the experiment gates in this order:
 
 1. quota and capacity check;
 2. two healthy GPU nodes;
@@ -30,14 +30,19 @@ Do not start normal training until all of these pass in order:
 4. shared-filesystem cross-node sentinel test;
 5. Harbor/Daytona oracle trial;
 6. one real Mini-SWE-Agent model rollout;
-7. one fully async two-node rollout; and
-8. the authenticated TLS callback test.
+7. one fully async two-node rollout;
+8. the authenticated TLS callback test; and
+9. one bounded normal-mode training step that consumes a Harbor rollout,
+   performs an optimizer/policy update, transfers the updated weights, and
+   writes its trace and checkpoint evidence.
 
-These gates describe the original cluster, distributed-runtime, Harbor, and
-rollout-validation scope. A policy/weight update was added later as a separate
-training smoke test. Do not treat a successful rollout-only run as proof that
-the training model, gradient buffers, optimizer state, and inference model fit
-in the selected GPU partition.
+The initial scope focused on cluster, distributed-runtime, Harbor, and rollout
+validation. The current experiment scope also requires gate 9 so the run
+exercises the training side of Miles rather than stopping at generation.
+`--debug-rollout-only` is an intermediate diagnostic and never satisfies the
+experiment by itself: it does not prove that the training model, gradient
+buffers, optimizer state, and inference model fit in the selected GPU
+partition.
 
 ## 1. Architecture and important differences from Runpod
 
@@ -1094,6 +1099,24 @@ Do not leave the first iteration unattended. Require the first rollout, GRPO
 step 0, trace write, and checkpoint write before increasing Daytona
 concurrency above one.
 
+The experiment is complete only when the logs and durable outputs prove all of
+the following for the same run:
+
+- Harbor launched the selected task in Daytona and returned a non-aborted
+  rollout to Miles;
+- Miles consumed that rollout in normal mode and completed one optimizer step;
+- updated policy weights were transferred to or acknowledged by the rollout
+  engine after the step;
+- the step's metrics, rollout/trajectory, trace, and checkpoint or checkpoint
+  manifest were stored durably; and
+- Research OS recorded the run configuration, `env_ref`, metrics, notes, and
+  portable Harbor artifacts without treating an optional artifact failure as
+  the training outcome.
+
+Set the run length and save interval so the job exits after this evidence is
+written. Do not scale concurrency or continue into an open-ended training run
+as part of this validation.
+
 ### Training-memory constraint observed on H100 80 GB
 
 The later one-update smoke test split the two-node cluster into one 8-GPU
@@ -1269,7 +1292,9 @@ created both Daytona sandboxes. This verified the real callback/task path
 through sandbox agent launch, but the run was stopped before either complete
 trajectory returned. A separate normal-mode attempt reached Megatron model
 initialization but did not complete a generation or policy update because of
-the training-memory constraint documented in section 18.
+the training-memory constraint documented in section 18. Therefore gate 9 is
+part of the current scope and remains unverified; the existing validation
+snapshot is a reproducible baseline, not a completed experiment.
 
 If a node returns `NotEnoughResources`, inspect the capacity advisor before
 changing Kubernetes resources. The error occurs before the node joins MK8S;
