@@ -173,9 +173,11 @@ the additional sampling fields mapped by the bridge.
 For a cloud sandbox provider, install the corresponding Harbor extra and set
 `HARBOR_ENVIRONMENT_TYPE` plus `MILES_HARBOR_ENVIRONMENT_KWARGS_JSON`. Docker
 remains the closest path for a local bridge smoke test. On a Runpod Instant
-Cluster where Docker is unavailable, use `harbor[daytona]`, set
-`HARBOR_ENVIRONMENT_TYPE=daytona`, and follow [RUNPOD_E2E.md](RUNPOD_E2E.md).
-The Runpod guide includes the separate external callback route that a Daytona
+Cluster or Nebius MK8S cluster where Docker is unavailable inside the GPU
+workload, or on standalone Nebius VMs where task sandboxes should stay outside
+the training hosts, use `harbor[daytona]`, set
+`HARBOR_ENVIRONMENT_TYPE=daytona`, and follow the matching provider runbook.
+Each guide includes the separate external callback route that a Daytona
 sandbox needs to reach the Miles session server.
 
 ## Remaining validation before GPU training
@@ -192,4 +194,6 @@ For the exact GPU-node preflight, networking gates, one-rollout test, and
 training launch commands, follow the provider guide:
 
 - [Runpod](RUNPOD_E2E.md)
+- [Nebius standalone VMs](NEBIUS_STANDALONE_E2E.md)
+- [Nebius MK8S](NEBIUS_E2E.md)
 - [Crusoe](CRUSOE_E2E.md)

@@ -5,13 +5,15 @@
 > after their Harbor APIs drifted, so the historical setup is not runnable as
 > written. For the maintained public-Harbor bridge, local smoke test, and
 > production configuration, see [PUBLIC_HARBOR.md](PUBLIC_HARBOR.md).
-> Provider runbooks: [Runpod](RUNPOD_E2E.md) and [Crusoe](CRUSOE_E2E.md).
+> Provider runbooks: [Runpod](RUNPOD_E2E.md),
+> [Nebius standalone VMs](NEBIUS_STANDALONE_E2E.md),
+> [Nebius MK8S](NEBIUS_E2E.md), and [Crusoe](CRUSOE_E2E.md).
 >
-> The Docker topology below is the historical/local deployment. On Runpod,
-> Docker is not required inside the GPU Pods: use the public bridge with a
-> Harbor cloud environment such as Daytona and follow the Instant Cluster
-> runbook. That guide covers templates, secrets, primary-node discovery,
-> shared storage, Ray bootstrap, and the external Miles callback.
+> The Docker topology below is the historical/local deployment. On Runpod and
+> Nebius MK8S, Docker is not required inside the GPU workload; the Nebius
+> standalone path runs Miles itself in Docker. All three use the public bridge
+> with a Harbor cloud environment such as Daytona. Follow the matching guide
+> for secrets, shared storage, Ray bootstrap, and the external callback.
 
 A unified pipeline for training agents on **mixed datasets** — SWE-bench, Terminal-Bench, custom tasks, etc. — through a single endpoint. Uses **TITO (Token In Token Out)** through SGLang's `/v1/chat/completions` for exact token-level training signals.
 
