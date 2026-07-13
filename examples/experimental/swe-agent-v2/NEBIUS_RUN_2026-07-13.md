@@ -288,3 +288,107 @@ start the two-node Ray cluster; start the Harbor bridge at concurrency 1; pass
 the authenticated oracle; pass one `debug_rollout_only` Mini-SWE-Agent trial;
 pass the two-node fully async trial through TLS; then launch normal mode and
 watch the first rollout, GRPO step 0, trace, checkpoint, and sandbox cleanup.
+
+## Follow-up after the full-node rollout — 2026-07-13
+
+This section supersedes the old Pod-resource, credential, and InfiniBand
+observations above. The historical failures remain recorded because they
+explain why the Deployment was replaced and why the low-memory conversion path
+was added.
+
+### Live Kubernetes state
+
+- Deployment `miles-dev` uses strategy `Recreate` and has one healthy Pod,
+  `miles-dev-68cd5f597d-wvqhx`, on the only Ready GPU node.
+- Container requests and limits are identical: 120 CPUs, 1400 GiB memory, and
+  eight `nvidia.com/gpu` devices. Kubernetes therefore assigns Guaranteed QoS.
+- The Pod is privileged, mounts the shared `miles-workspace` PVC at
+  `/workspace`, and mounts a 256 GiB memory-backed `emptyDir` at `/dev/shm`.
+- Cgroup v2 is visible as a host-wide hierarchy in the privileged container.
+  The effective container path must be resolved from `/proc/self/cgroup`; the
+  root `/sys/fs/cgroup/{cpu,memory}.max` paths are not valid in this layout.
+  At the delegated path, `cpu.max=12000000 100000`,
+  `memory.max=1503238553600`, `memory.swap.max=0`, and all OOM counters were
+  zero.
+- `/workspace` passed a write/read/delete probe and had approximately 908 GiB
+  free. The second-node cross-PVC sentinel remains blocked until another node
+  is Ready.
+- `DAYTONA_API_KEY`, `MILES_HARBOR_AUTH_TOKEN`,
+  `AGENT_SERVER_AUTH_TOKEN`, and `MILES_SESSION_API_KEY` are all injected from
+  Kubernetes Secrets. Only presence was checked; values were not printed.
+
+### Single-node gates passed
+
+- Eight NVIDIA H100 80 GB GPUs are visible. PyTorch 2.11.0+cu130 reports CUDA
+  13.0; Ray 2.56.0 and SGLang 0.5.15.dev24+g2fdb655 import successfully.
+- `/dev/infiniband` exposes eight `uverbs`, `umad`, and `issm` devices plus
+  `rdma_cm`. `mlx5_0` through `mlx5_7` all reported `ACTIVE` at 400 Gb/s
+  (4X NDR).
+- `nvidia-smi topo -m` reports NV18 between every GPU pair and maps eight
+  Mellanox NICs.
+- Fresh matrix multiplication on every GPU and an eight-rank NCCL all-reduce
+  passed with the expected sum of 36. This proves single-node CUDA/NVLink/NCCL,
+  not cross-node GPUDirect RDMA.
+- A temporary one-node Ray head reported exactly 120 CPUs, eight GPUs,
+  approximately 1.36 TiB schedulable memory, and a 200 GB object store. Eight
+  simultaneous one-GPU Ray actors were assigned unique devices 0 through 7
+  and completed CUDA work. Ray was stopped after the gate.
+- `runpod_preflight.py --phase repo` passed 14 checks with zero failures or
+  warnings. The relevant experimental contract suite passed all 18 tests, and
+  Ruff passed the bridge, agent adapter, and tests (apart from an existing
+  top-level-settings deprecation warning).
+- The staged data still contains 89 Terminal-Bench 2 tasks and a one-row smoke
+  dataset for `adaptive-rejection-sampler`. The GLM-4.7-Flash HF checkpoint
+  loads as `glm4_moe_lite` with vocabulary size 154856, and the converted
+  57 GB `torch_dist` checkpoint has its `release` tracker and metadata.
+
+### Authenticated Daytona oracle passed
+
+The bridge was bound only to `127.0.0.1:18081` at concurrency one for this
+gate; no public Service or load balancer was created.
+
+- `/health` returned the expected Daytona configuration.
+- An unauthenticated `/run` request returned HTTP 401.
+- The authenticated `adaptive-rejection-sampler` oracle created a real Daytona
+  sandbox, executed the task and verifier, returned HTTP 200 with
+  `exit_status=Submitted` and reward `1.0`, and wrote complete Harbor trial
+  artifacts.
+- The bridge process was stopped afterward. A Daytona API listing returned
+  zero live sandboxes, confirming provider cleanup.
+- Non-secret artifacts are under
+  `/workspace/harbor/trials/adaptive-rejection-sampler__Dfnf3b3` and
+  `/workspace/logs/public-harbor-oracle-20260713T185127Z.json`.
+
+The oracle deliberately does not call the Miles model endpoint. A real
+Mini-SWE-Agent rollout still needs a reviewed externally reachable callback
+origin for the session server.
+
+### Capacity finding and remaining gates
+
+The node group still targets two regular `8gpu-128vcpu-1600gb` VMs on
+`fabric-3`, but only `computeinstance-e00z8dmjvrx3svrpx2` is Ready. The second
+managed instance repeatedly failed Compute placement with
+`NotEnoughResources` before entering another `STARTING` reconciliation.
+
+At the 2026-07-13 18:44 UTC capacity check, the project quota allowed four
+regular eight-GPU VMs, while the advisor exposed no immediately available
+regular eight-H100 placement on fabrics 2, 3, 4, or 6. Fabric 2 and fabric 4
+reported high preemptible availability; fabric 3 did not. This is provider
+physical capacity, not a Miles Pod limit and not evidence of insufficient
+account credits.
+
+Do not remove the current fabric assignment or delete the working node. For a
+stable two-node job, obtain regular capacity or a reservation. If an
+interruption-tolerant preemptible run is acceptable, create a separate GPU
+cluster and two-node group on a fabric with capacity so both nodes share one
+InfiniBand topology.
+
+The remaining hard gates are:
+
+1. two Ready GPU nodes in one GPU cluster/fabric;
+2. the official two-node NCCL/InfiniBand test;
+3. a cross-node shared-filesystem sentinel;
+4. 16-GPU/two-node Ray and the fully asynchronous rollout path;
+5. an authenticated externally reachable TLS session callback;
+6. one real Mini-SWE-Agent rollout through that callback; and
+7. only then, a monitored normal-mode optimizer iteration.

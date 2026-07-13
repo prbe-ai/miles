@@ -179,6 +179,30 @@ Select a fabric that reports enough current capacity for two
 not a guarantee. For reliable repeated availability, ask Nebius about a
 capacity reservation.
 
+Do not remove the GPU-cluster assignment merely to let the scheduler choose an
+arbitrary fabric for a multi-node training job. The fabric belongs to the
+Nebius GPU cluster, and the VMs are attached to that cluster when they are
+created. Moving fabrics therefore means creating a new GPU cluster on the
+target fabric and a new node group whose training nodes all use it. Nodes from
+different fabrics do not provide the intended shared InfiniBand topology.
+
+If a two-node group reaches only one Ready node and the other VM repeatedly
+fails with `NotEnoughResources`:
+
+1. Preserve the healthy node and stop issuing overlapping restart requests.
+2. Compare the capacity advisor's `available` and `availability_level` values
+   for the exact eight-GPU preset, fabric, and regular/preemptible VM type.
+3. Continue the single-node repository, CUDA, NCCL, Ray, checkpoint, and
+   Harbor/Daytona gates while capacity is unavailable.
+4. Use a reservation for reliable regular capacity. Use a separate
+   preemptible two-node group only for a checkpointed, interruption-tolerant
+   run, and keep both nodes in one newly selected GPU cluster.
+
+An `available` value below the requested node count is a physical-placement
+constraint even when the project's VM quota is higher. Account-credit or
+billing failures use different service errors; `NotEnoughResources` is not
+evidence of insufficient credits.
+
 Check project quotas in **Administration → Limits → Quotas**. Default quotas
 do not prove the project's current quota or free capacity.
 
@@ -770,12 +794,20 @@ kubectl get pod -n miles miles-head \
   -o jsonpath='{.spec.containers[?(@.name=="miles")].resources}{"\n"}'
 
 kubectl exec -n miles miles-head -- bash -lc '
-  printf "cpu.max="; cat /sys/fs/cgroup/cpu.max
-  printf "memory.max="; cat /sys/fs/cgroup/memory.max
-  printf "memory.swap.max="; cat /sys/fs/cgroup/memory.swap.max
+  CGROUP_PATH="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+  printf "cgroup_path=%s\n" "$CGROUP_PATH"
+  printf "cpu.max="; cat "$CGROUP_PATH/cpu.max"
+  printf "memory.max="; cat "$CGROUP_PATH/memory.max"
+  printf "memory.swap.max="; cat "$CGROUP_PATH/memory.swap.max"
+  printf "memory.events="; cat "$CGROUP_PATH/memory.events"
   df -h /dev/shm
 '
 ```
+
+Resolving the process's delegated path matters in privileged containers where
+the host-wide cgroup hierarchy is visible. In that layout, reading
+`/sys/fs/cgroup/cpu.max` directly either fails or reports a parent rather than
+the workload container's effective limit.
 
 For the manifest above, `memory.max` should reflect `1400Gi`, `cpu.max` should
 represent 120 CPUs, and `/dev/shm` should be 256 GiB. If an existing Pod shows
