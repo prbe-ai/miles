@@ -71,6 +71,59 @@ The Runpod `NODE_RANK`, `NODE_ADDR`, `PRIMARY_ADDR`, `ens1`, and symmetrical
 TCP-port instructions do not apply. Kubernetes DNS, Pod IPs, Services, and
 Nebius's `eth0`/InfiniBand configuration replace them.
 
+### Docker choices on Nebius
+
+Do not assume that an MK8S workload has a Docker daemon. The Kubernetes
+container runtime is not a Docker API, and mounting a node runtime socket into
+an untrusted task runner would grant host-level control. Docker-in-Docker is
+also not a fix for an undersized Pod: it requires a privileged Pod, its own
+daemon storage, additional memory/PIDs, and a deliberate security review.
+
+There are two supported ways to keep Docker in the architecture without
+putting it inside the GPU Pod:
+
+1. Use the standalone-VM topology in `NEBIUS_STANDALONE_E2E.md`. Nebius Compute
+   supports ordinary GPU VMs and custom Docker containers over VMs; this is the
+   simpler choice when Kubernetes scheduling is not required.
+2. Keep Miles on MK8S, but run the public Harbor bridge and its `docker`
+   environments on a separate CPU Compute VM. Put that VM in the same region
+   and subnet as MK8S, set `HARBOR_ENVIRONMENT_TYPE=docker`, and point
+   `AGENT_SERVER_URL` at the VM's private address. Expose the head-only session
+   Service through a private Nebius load balancer so Docker task containers can
+   call back without a public route:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: miles-session-private
+  namespace: miles
+  annotations:
+    nebius.com/load-balancer-type: "internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app: miles
+    role: head
+  ports:
+    - name: session
+      protocol: TCP
+      port: 30000
+      targetPort: 30000
+```
+
+Nebius requires the private client VM and private load balancer to be in the
+same region and subnet. Restrict the VM and load balancer with security groups,
+retain `MILES_SESSION_API_KEY`, and add private TLS/DNS if policy requires it.
+The CPU VM needs enough boot-disk space for Docker layers and concurrent task
+containers. This design replaces Daytona; do not configure both providers for
+the same bridge process.
+
+For the fastest first proof on the existing MK8S topology, Daytona remains the
+least operationally invasive option because it needs neither Docker privileges
+nor a new VM. It still requires an externally reachable authenticated session
+callback.
+
 ## 2. Information required before creating chargeable resources
 
 Record these values before running any create command. Do not record secrets.
@@ -455,6 +508,10 @@ node `hostPath` as a substitute.
 Generate independent bridge and session secrets. Create a local file with
 mode `0600`; do not commit or paste it into run notes:
 
+If any credential has already appeared in chat, shell history, or a log,
+rotate it before creating the Kubernetes Secret. Treat the replacement as the
+only usable value.
+
 ```bash
 umask 077
 export AGENT_SERVER_AUTH_TOKEN="$(openssl rand -hex 32)"
@@ -499,6 +556,15 @@ the shared filesystem and installed editable with `--no-deps`; do not rebuild
 the patched CUDA/SGLang/Megatron dependency stack from a generic image.
 
 Create `/tmp/miles-nebius.yaml`:
+
+The CPU and memory values below are deliberately explicit. The target H100
+preset has 128 vCPUs and 1600 GiB RAM, while namespace `LimitRange` defaults or
+an enclosing development platform may otherwise inject a much smaller
+container limit. Confirm the actual Kubernetes Node `allocatable` values and
+namespace quota before applying. `1Ti` requested / `1400Gi` limited RAM leaves
+node and add-on headroom while making the optimizer's CPU-offload budget
+visible to the scheduler. The memory-backed 256 GiB `/dev/shm` counts against
+the container memory limit.
 
 ```yaml
 apiVersion: v1
@@ -585,8 +651,12 @@ spec:
           value: "14400"
       resources:
         requests:
+          cpu: "96"
+          memory: 1Ti
           nvidia.com/gpu: "8"
         limits:
+          cpu: "120"
+          memory: 1400Gi
           nvidia.com/gpu: "8"
       volumeMounts:
         - name: workspace
@@ -652,8 +722,12 @@ spec:
           value: /root/Megatron-LM
       resources:
         requests:
+          cpu: "96"
+          memory: 1Ti
           nvidia.com/gpu: "8"
         limits:
+          cpu: "120"
+          memory: 1400Gi
           nvidia.com/gpu: "8"
       volumeMounts:
         - name: workspace
@@ -682,6 +756,39 @@ different GPU nodes. Stop if either is not `Running`, has fewer than eight
 visible GPUs, or both report the same Kubernetes node.
 
 ## 12. GPU, image, and shared-filesystem preflight
+
+Before the GPU probes, verify the effective container thresholds. Do not trust
+`free` or `nproc` alone inside a container because they may show host totals:
+
+```bash
+kubectl get nodes \
+  -o custom-columns='NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,GPU:.status.allocatable.nvidia\.com/gpu'
+
+kubectl get limitrange,resourcequota -n miles -o yaml
+
+kubectl get pod -n miles miles-head \
+  -o jsonpath='{.spec.containers[?(@.name=="miles")].resources}{"\n"}'
+
+kubectl exec -n miles miles-head -- bash -lc '
+  printf "cpu.max="; cat /sys/fs/cgroup/cpu.max
+  printf "memory.max="; cat /sys/fs/cgroup/memory.max
+  printf "memory.swap.max="; cat /sys/fs/cgroup/memory.swap.max
+  df -h /dev/shm
+'
+```
+
+For the manifest above, `memory.max` should reflect `1400Gi`, `cpu.max` should
+represent 120 CPUs, and `/dev/shm` should be 256 GiB. If an existing Pod shows
+a smaller value, update the owning Deployment/StatefulSet/other controller's
+Pod template. Editing a controller-owned Pod directly is not durable. On the
+runbook's Kubernetes 1.33 baseline, replace the Pod after changing the
+template; do not depend on newer in-place resize support.
+
+An eight-GPU Pod consumes a whole H100 node. A normal rolling update with
+`maxSurge: 1` may remain Pending unless a third eight-GPU node is available.
+For a controlled maintenance window, use a reviewed `Recreate` strategy or
+`maxSurge: 0`, `maxUnavailable: 1`, preserve `/workspace`, stop Ray/Harbor
+cleanly, and expect the active training session to end when the old Pod exits.
 
 ```bash
 kubectl exec -n miles miles-head -- nvidia-smi -L
@@ -1107,3 +1214,5 @@ resolved before the real rollout/training gates.
 - [Compute/GPU/storage/InfiniBand quotas](https://docs.nebius.com/compute/resources/quotas-limits)
 - [Nebius CLI profile configuration](https://docs.nebius.com/cli/configure)
 - [Supported Kubernetes versions](https://docs.nebius.com/kubernetes/versions)
+- [Containers over Compute VMs](https://docs.nebius.com/compute/virtual-machines/containers)
+- [Upstream Kubernetes container resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)

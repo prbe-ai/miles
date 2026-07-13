@@ -1,10 +1,19 @@
 import gc
 import os
 import shutil
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint import FileSystemWriter
 from megatron.core.enums import ModelType
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.strategies.base import SaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.torch import (
+    MCoreSavePlanner,
+    _replace_state_dict_keys_with_sharded_keys,
+    mcore_to_pyt_state_dict,
+)
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
 from megatron.training.training import get_model
@@ -27,11 +36,57 @@ def add_conversion_args(parser):
         default="raw",
         help="The method to convert megatron weights to hugging face weights for SGLang.",
     )
+    parser.add_argument(
+        "--low-memory-checkpoint-save",
+        action="store_true",
+        help=(
+            "Stream GPU tensors through PyTorch's synchronous distributed-checkpoint "
+            "writer instead of staging the complete local shard in host memory."
+        ),
+    )
     try:
         parser.add_argument("--padded-vocab-size", type=int, default=None)
     except Exception:
         pass
     return parser
+
+
+class LowMemoryTorchDistSaveStrategy(SaveShardedStrategy):
+    """Write a torch_dist checkpoint without preloading every tensor to CPU.
+
+    Megatron's default filesystem-async strategy stages a rank's complete local
+    shard in host memory even for a synchronous save. That is fast on the normal
+    high-memory training Pods, but it can exceed a development Pod's cgroup
+    limit during one-time checkpoint conversion. PyTorch's standard filesystem
+    writer keeps a small copy-ahead window and produces the same torch_dist
+    storage format.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("torch_dist", 1)
+
+    @property
+    def can_handle_sharded_objects(self) -> bool:
+        return True
+
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> None:
+        sharded_state_dict, _, _ = _replace_state_dict_keys_with_sharded_keys(
+            sharded_state_dict, keep_only_main_replica=True
+        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        writer = FileSystemWriter(
+            checkpoint_dir,
+            thread_count=1,
+            per_thread_copy_ahead=10_000_000,
+        )
+        torch.distributed.checkpoint.save(
+            state_dict=pyt_state_dict,
+            storage_writer=writer,
+            planner=MCoreSavePlanner(
+                dedup_replicated_tensors=False,
+                flatten_state_dict=False,
+            ),
+        )
 
 
 def get_args():
@@ -126,7 +181,10 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    save_checkpoint(1, model, None, None, 0)
+    checkpointing_context = None
+    if args.low_memory_checkpoint_save:
+        checkpointing_context = {"save_strategy": LowMemoryTorchDistSaveStrategy()}
+    save_checkpoint(1, model, None, None, 0, checkpointing_context=checkpointing_context)
 
     if dist.get_rank() == 0:
         source_dir = get_checkpoint_name(args.save, 1, False, return_base_dir=True)
