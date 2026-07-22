@@ -71,6 +71,9 @@ async def test_bridge_auth_correlation_and_capture_are_forwarded(monkeypatch) ->
             "rollout_id": 17,
             "sample_id": 41,
             "group_id": 9,
+            "dataset_name": "swebench-verified",
+            "osmosis_mix_id": "customer-mix-a",
+            "prompt": "must not be copied into capture context",
         },
     )
 
@@ -78,6 +81,10 @@ async def test_bridge_auth_correlation_and_capture_are_forwarded(monkeypatch) ->
     assert seen["headers"] == {"Authorization": "Bearer bridge-secret"}
     assert seen["payload"]["api_key"] == "session-secret"
     assert seen["payload"]["rollout_id"] == 17
+    assert seen["payload"]["capture_context"] == {
+        "dataset_name": "swebench-verified",
+        "osmosis_mix_id": "customer-mix-a",
+    }
     assert result["trial_id"] == "trial-1"
     assert result["step_index"] == 17
     assert result["capture"]["status"] == "complete"

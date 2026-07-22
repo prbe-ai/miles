@@ -11,6 +11,7 @@ differentiation (environment, grading harness, agent selection).
 """
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
@@ -19,6 +20,51 @@ from urllib.parse import urlparse, urlsplit, urlunparse
 from miles.utils.http_utils import post
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_CONTEXT_KEYS = {
+    "client_id",
+    "customer_id",
+    "data_mix",
+    "data_mix_id",
+    "data_source_id",
+    "dataset",
+    "dataset_id",
+    "dataset_name",
+    "dataset_split",
+    "mix",
+    "mix_id",
+    "osmosis_dataset_id",
+    "osmosis_mix_id",
+    "split",
+    "task_type",
+}
+_CAPTURE_CONTEXT_PREFIXES = ("data_mix_", "dataset_", "osmosis_")
+
+
+def _capture_context(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Lift bounded mix/dataset identity into the stack-agnostic descriptor."""
+    explicit = metadata.get("capture_context")
+    candidates = list(explicit.items()) if isinstance(explicit, dict) else []
+    candidates.extend(metadata.items())
+    context: dict[str, Any] = {}
+    for key, value in candidates:
+        if not isinstance(key, str):
+            continue
+        normalized = key.lower()
+        is_explicit = isinstance(explicit, dict) and key in explicit
+        if (
+            not is_explicit
+            and normalized not in _CAPTURE_CONTEXT_KEYS
+            and not normalized.startswith(_CAPTURE_CONTEXT_PREFIXES)
+        ):
+            continue
+        try:
+            encoded = json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        if len(encoded.encode()) <= 4096:
+            context.setdefault(key, value)
+    return context
 
 
 async def run(
@@ -62,6 +108,8 @@ async def run(
         "sampling_params": request_kwargs,
         "api_key": session_api_key or "dummy",
     }
+    if capture_context := _capture_context(metadata):
+        request["capture_context"] = capture_context
 
     max_seq_len = metadata.get("max_seq_len")
     if max_seq_len is not None:
