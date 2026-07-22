@@ -924,6 +924,7 @@ export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
 export HARBOR_DATA_ROOT=/workspace/harbor
 export HARBOR_TASKS_DIR="$HARBOR_DATA_ROOT/tasks/terminal-bench-2"
 export HARBOR_TRIALS_DIR="$HARBOR_DATA_ROOT/trials"
+export MILES_HARBOR_CAPTURE_DIR="$HARBOR_DATA_ROOT/captures"
 export HARBOR_ENVIRONMENT_TYPE=daytona
 export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{}'
 export HARBOR_DELETE_ENVIRONMENTS=true
@@ -931,7 +932,7 @@ export AGENT_MAX_CONCURRENT=1
 export MILES_HARBOR_REQUEST_TIMEOUT_SEC=14400
 export AGENT_SERVER_URL=http://miles-head.miles.svc.cluster.local:18080
 
-mkdir -p /workspace/logs "$HARBOR_TRIALS_DIR"
+mkdir -p /workspace/logs "$HARBOR_TRIALS_DIR" "$MILES_HARBOR_CAPTURE_DIR"
 nohup "$HARBOR_VENV/bin/python" \
   "$MILES_ROOT/examples/experimental/swe-agent-v2/public_harbor_server.py" \
   --host 0.0.0.0 --port 18080 \
@@ -939,6 +940,21 @@ nohup "$HARBOR_VENV/bin/python" \
 
 curl -fsS "$AGENT_SERVER_URL/health"
 ```
+
+Start the independent Probe consumer against the same PVC. The Harbor bridge
+only stages native files and descriptors; this process validates and uploads
+them without adding network latency to `Trial.run()`:
+
+```bash
+export PROBE_TOKEN='<write token from the Kubernetes secret>'
+nohup probe trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
+  >/workspace/logs/probe-harbor-export.log 2>&1 &
+```
+
+Do not point the watcher at `HARBOR_TRIALS_DIR`. The capture directory is the
+atomic handoff boundary and survives Harbor sandbox teardown, bridge restarts,
+and Research OS outages. `probe trial drain "$MILES_HARBOR_CAPTURE_DIR"`
+performs a one-shot repair after an outage.
 
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, and Daytona cleanup. This still does not prove
@@ -1304,19 +1320,17 @@ that fabric reports capacity for both nodes.
 
 ## 23. Research OS instrumentation and Harbor artifact capture
 
-Research OS is installed with the SDK-first CLI (`exp` 0.1.0, package 0.4.0)
-and the `research-os` Claude plugin. Writes use the authenticated `exp` CLI or
-SDK; reads use the plugin's hosted MCP. Keep the write PAT and read-only MCP
-PAT in environment/configuration only; never put either in this file, shell
-history, logs, or run metadata.
+Research OS writes use the Probe SDK/CLI. Keep its write token in the
+Kubernetes secret only; never put it in this file, shell history, logs, run
+configuration, or capture manifests.
 
 The SDK gives an MLflow/W&B-like lifecycle:
 
 ```python
-from ros.sdk.client import Client
+from probe import Client
 
-with Client() as ros:
-    run = ros.run(
+with Client() as probe:
+    run = probe.run(
         project="miles-nebius",
         experiment="swe-agent-v2-nebius",
         hypothesis="A full-resource two-node H100 MK8S deployment can pass the Harbor oracle and distributed communication gates.",
@@ -1328,18 +1342,41 @@ with Client() as ros:
     run.log({"nccl_bus_gbps": 414.57, "harbor_reward": 1.0}, step=0,
             kind="validation")
     run.log({"gpu_count": 8, "node_count": 2}, kind="hardware")
-    run.log_artifact("harbor-trial.tar.gz", path="/path/to/harbor-trial.tar.gz",
-                     kind="sandbox_artifact")
     run.link(nebius_cluster="<cluster-id>", node_group="<node-group-id>",
              gpu_cluster="<gpu-cluster-id>")
     run.finish("completed", summary={"callback_rollout": "not_run"})
 ```
 
-The CLI equivalents are `exp run start`, `exp snapshot RUN`, `exp log RUN
-key=value`, `exp artifact add RUN PATH`, `exp note add RUN`, `exp link RUN
---set key=value`, and `exp run end RUN`. Use `exp run check RUN` before
-handoff; it reports missing execution records, code snapshots, or portable
-artifact bytes.
+For a training run, prefer the additive Miles backend instead of inserting
+SDK calls into rollout code:
+
+```bash
+export MILES_USE_PROBE=1
+export PROBE_PROJECT=miles-nebius
+export PROBE_EXPERIMENT=swe-agent-v2-nebius
+export PROBE_EXTERNAL_ID='<stable Nebius/Ray job ID>'
+export PROBE_QUEUE_DIR=/workspace/probe/metrics
+```
+
+Miles queues every scalar with its existing step, event time, producer ID, and
+producer-local sequence before returning to training. The primary process
+creates or resumes the run, captures the launch snapshot and native IDs, and
+exports from the PVC in the background. API initialization failures retain a
+complete run-creation intent; repair with
+`python -m miles.utils.tracking_utils.probe_utils <queue-directory>`.
+That command prints the resolved `run_id`. If bridge descriptors were created
+before the run existed, bind and drain them with
+`probe trial drain "$MILES_HARBOR_CAPTURE_DIR" --run <resolved-run-id>`; the
+consumer rejects conflicting identities and persists the repair into each
+descriptor.
+
+The Harbor bridge receives that run ID automatically through Miles rollout
+metadata. Each trial stages `trial/`, `trial.tar.gz`,
+`capture-manifest.json`, and `export-request.json` under
+`MILES_HARBOR_CAPTURE_DIR`. `probe trial watch` validates hashes and sizes,
+creates the default Harbor trial span, uploads every regular file with its
+rollout step/correlation metadata, and updates the local publication ledger.
+No client-specific `manifest.json` edit and no ATIF conversion are required.
 
 Harbor's `HARBOR_DELETE_ENVIRONMENTS=true` correctly cleaned the Daytona
 sandbox after the oracle. That means the durable upload is the collected
@@ -1385,10 +1422,11 @@ Remaining instrumentation considerations:
    checkpoints and full filesystem trees should remain on the durable PVC;
    upload manifests, logs, trial bundles, and checksums rather than copying
    hundreds of gigabytes into the tracker.
-6. The artifact presign flow currently stores uploaded bytes as kind `file`;
-   requested artifact `kind` and `meta` are not carried through that backend
-   flow yet. Put semantic type and lineage in the run notes/manifest until the
-   upload API accepts those fields.
+6. A drained metric queue proves publication only for records observed in that
+   queue. Miles does not yet expose a reliable expected-Ray-producer set or a
+   close barrier for every secondary tracker, so the ledger reports capture
+   completeness as `unknown` and names those missing guarantees instead of
+   claiming completeness.
 
 ## Official references
 
