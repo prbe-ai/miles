@@ -46,7 +46,7 @@ Docker Network (swe-net)
 | File | Description |
 | --- | --- |
 | `run.sh` | Training launcher — handles Ray lifecycle, model loading, and job submission |
-| `server.py` | FastAPI server wrapping Harbor Trial API — deploy in the agent-env container |
+| `public_harbor_server.py` | FastAPI server wrapping Harbor Trial API and staging native trial captures |
 | `swe_agent_function.py` | Custom agent function — dispatches to Harbor server, returns env metadata |
 | `generate.py` | Reward function, agent metrics aggregation, `RolloutFn` |
 | `download_and_process_data.py` | Download from HuggingFace or local JSONL, convert to Miles format |
@@ -250,6 +250,9 @@ Then open `http://<host>:8081` in a browser.
 | `AGENT_MODEL_NAME` | `model` | Model name passed to agents |
 | `AGENT_MAX_CONCURRENT` | `8` | Max concurrent Harbor trials |
 | `HARBOR_TASKS_DIR` | `/root/harbor_tasks` | Root directory containing task subdirectories |
+| `HARBOR_TRIALS_DIR` | `./trials` | Harbor's native host-side trial output directory |
+| `MILES_HARBOR_CAPTURE_DIR` | sibling `<trials>-captures` | Durable staging directory; set this to a shared PVC in production |
+| `HARBOR_DELETE_ENVIRONMENTS` | `true` | Whether Harbor deletes the sandbox during `Trial.run()` cleanup |
 | `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Hostname for agent containers to reach Miles Router |
 | `MILES_HOST_IP` | `$(hostname)` | IP/hostname for inter-container communication |
 
@@ -266,14 +269,47 @@ These are passed as CLI args to `run.sh` (not defaults, since they vary per mode
 
 1. **Session creation**: `agentic_tool_call.generate` creates a session on Miles Router
 2. **Dispatch to agent**: calls `swe_agent_function.run()` which POSTs to the Harbor server
-3. **Harbor Trial**: `server.py` creates a `TrialConfig` and runs `Trial.run()`:
+3. **Harbor Trial**: `public_harbor_server.py` creates a `TrialConfig` and runs `Trial.run()`:
    - Starts a Docker container from the task's Dockerfile
    - Installs and runs the agent (determined by `agent_name` in metadata)
    - Agent calls back to Miles Router at `OPENAI_API_BASE` for model inference
    - Runs the verifier (`test.sh`) and returns `TrialResult` with reward
 4. **TITO recording**: Miles Router proxies each `/v1/chat/completions` to SGLang and records exact token IDs and logprobs
-5. **Sample building**: Records are converted to training `Sample`s with token IDs, logprobs, loss masks
-6. **Training**: GRPO policy update using Megatron, then weights synced back to SGLang engines
+5. **Native capture**: after `Trial.run()` returns, the bridge atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes `capture-manifest.json` plus a pending `export-request.json`
+6. **Sample building**: Records are converted to training `Sample`s with token IDs, logprobs, loss masks
+7. **Training**: GRPO policy update using Megatron, then weights synced back to SGLang engines
+
+### Native Harbor capture boundary
+
+Set `MILES_HARBOR_CAPTURE_DIR` to a shared PVC. Each completed capture contains
+`trial/` (directly consumable by `probe.connectors.harbor.capture_trial`),
+`trial.tar.gz`, `capture-manifest.json`, and `export-request.json`. The descriptor
+includes the Probe run, Miles rollout/step, sample/group, model session, Harbor
+trial, and sandbox correlation IDs when available. Export requests set
+`expand: false`: native trajectories are retained as ordinary raw files today,
+without requiring ATIF or creating turn/tool-call spans.
+
+Run the Probe exporter against the same shared capture directory. It validates
+the producer manifest and every file hash before uploading, then records its
+remote publication state back into the descriptor:
+
+```bash
+export PROBE_TOKEN='<write token>'
+probe trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5
+```
+
+The bridge does not import the SDK and does not block a rollout on network
+uploads. A stopped watcher or API outage leaves the descriptor and staged bytes
+on the PVC; `probe trial drain "$MILES_HARBOR_CAPTURE_DIR"` resumes them. The
+run ID is supplied automatically by Miles when Probe tracking is enabled, or
+may be supplied as `PROBE_RUN_ID` for a pre-created run.
+
+Completeness is deliberately scoped to the **host Harbor trial tree**. Harbor
+0.18 stops/deletes its environment inside `Trial.run()` before the bridge gets
+control back. Harbor downloads its configured agent logs and artifacts before
+that cleanup, but arbitrary sandbox state outside those configured Harbor
+outputs is unknowable after deletion. The bridge does not claim that staging
+precedes sandbox teardown.
 
 ### Multi-turn merge (TITO mode)
 
@@ -316,6 +352,6 @@ Multi-turn merge fails due to BPE re-tokenization inconsistency. Use `--generate
 
 ### Trace-viewer shows no trajectories
 
-- Trial artifacts are saved inside the **agent_env** container (not miles), at the path Harbor uses (default: `./trials/` relative to where `server.py` runs)
+- Native trial artifacts are saved on the Harbor host at `HARBOR_TRIALS_DIR`; durable copies are published under `MILES_HARBOR_CAPTURE_DIR`
 - Point the trace-viewer at the correct directory inside agent_env
 - Restart the trace-viewer after clearing old data (it caches in memory)

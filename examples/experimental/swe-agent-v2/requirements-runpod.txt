@@ -1,0 +1,5 @@
+-r requirements-public-harbor-server.txt
+harbor[daytona]==0.18.0
+# Match Harbor 0.18.0's published lock instead of resolving future releases.
+daytona==0.192.0
+litellm==1.86.2

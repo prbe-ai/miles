@@ -40,6 +40,12 @@ async def run(
         "AGENT_MODEL_NAME",
         os.getenv("SWE_AGENT_MODEL_NAME", "model"),
     )
+    auth_token = os.getenv(
+        "AGENT_SERVER_AUTH_TOKEN",
+        os.getenv("MILES_HARBOR_AUTH_TOKEN", ""),
+    )
+    server_timeout_sec = float(os.getenv("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_api_key = os.getenv("MILES_SESSION_API_KEY", "")
 
     session_url = f"{base_url}/v1"
     external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
@@ -54,6 +60,7 @@ async def run(
         "base_url": session_url,
         "model": f"openai/{model_name}",
         "sampling_params": request_kwargs,
+        "api_key": session_api_key or "dummy",
     }
 
     max_seq_len = metadata.get("max_seq_len")
@@ -73,11 +80,15 @@ async def run(
 
     try:
         response = await asyncio.wait_for(
-            post(f"{agent_server_url}/run", request),
-            timeout=3600,  # 1 hour max per trial
+            post(
+                f"{agent_server_url}/run",
+                request,
+                headers={"Authorization": f"Bearer {auth_token}"} if auth_token else None,
+            ),
+            timeout=server_timeout_sec,
         )
     except asyncio.TimeoutError:
-        logger.error("Agent server call timed out after 3600s")
+        logger.error("Agent server call timed out after %ss", server_timeout_sec)
         return None
     except asyncio.CancelledError:
         logger.warning("Agent server call cancelled (sibling task failure?)")
@@ -86,12 +97,32 @@ async def run(
         logger.error(f"Agent server call failed: {e}")
         return None
 
-    return {
+    result = {
         "reward": response.get("reward", 0.0),
         "exit_status": response.get("exit_status", ""),
         "eval_report": response.get("eval_report", {}),
         "agent_metrics": response.get("agent_metrics", {}),
     }
+    for key in (
+        "trial_id",
+        "trial_name",
+        "task_id",
+        "sandbox_id",
+        "provider_sandbox_id",
+        "session_id",
+        "trial_dir",
+        "external_key",
+        "run_id",
+        "miles_run_id",
+        "rollout_id",
+        "sample_id",
+        "group_id",
+        "step_index",
+        "capture",
+    ):
+        if key in response:
+            result[key] = response[key]
+    return result
 
 
 async def abort(args) -> None:
