@@ -942,8 +942,9 @@ curl -fsS "$AGENT_SERVER_URL/health"
 ```
 
 Start the independent Probe consumer against the same PVC. The Harbor bridge
-only stages native files and descriptors; this process validates and uploads
-them without adding network latency to `Trial.run()`:
+calls the Probe SDK only to stage native files and an SDK-owned descriptor;
+this process validates and uploads them without adding network latency to
+`Trial.run()`:
 
 ```bash
 export PROBE_TOKEN='<write token from the Kubernetes secret>'
@@ -1358,11 +1359,11 @@ export PROBE_EXTERNAL_ID='<stable Nebius/Ray job ID>'
 export PROBE_QUEUE_DIR=/workspace/probe/metrics
 ```
 
-Miles queues every scalar with its existing step, event time, producer ID, and
-producer-local sequence before returning to training. The primary process
-creates or resumes the run, captures the launch snapshot and native IDs, and
-exports from the PVC in the background. API initialization failures retain a
-complete run-creation intent; repair with
+The Probe SDK integration queues every Miles scalar with its existing step,
+event time, producer ID, and producer-local sequence before returning to
+training. The primary process creates or resumes the run, captures the launch
+snapshot and native IDs, and exports from the PVC in the background. API
+initialization failures retain a complete run-creation intent; repair with
 `python -m miles.utils.tracking_utils.probe_utils <queue-directory>`.
 That command prints the resolved `run_id`. If bridge descriptors were created
 before the run existed, bind and drain them with
@@ -1371,7 +1372,8 @@ consumer rejects conflicting identities and persists the repair into each
 descriptor.
 
 The Harbor bridge receives that run ID automatically through Miles rollout
-metadata. Each trial stages `trial/`, `trial.tar.gz`,
+metadata and passes only the trial path plus native correlation to the SDK.
+The SDK stages `trial/`, `trial.tar.gz`,
 `capture-manifest.json`, and `export-request.json` under
 `MILES_HARBOR_CAPTURE_DIR`. `probe trial watch` validates hashes and sizes,
 creates the default Harbor trial span, uploads every regular file with its
