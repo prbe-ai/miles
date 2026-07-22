@@ -206,7 +206,9 @@ def validate_callback_url(base_url: str, settings: Settings) -> None:
     if settings.allow_any_callback:
         return
     if parsed.hostname.lower() not in settings.allowed_callback_hosts:
-        raise ValueError(f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS")
+        raise ValueError(
+            f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS"
+        )
 
 
 def validate_session_server_id(session_server_id: str, settings: Settings) -> None:
@@ -366,9 +368,7 @@ def _completed_capture(final_dir: Path, *, trial_id: str, external_key: str) -> 
     if trial.get("id") != trial_id or source.get("external_key") != external_key:
         return None
     capture = manifest.get("capture") if isinstance(manifest.get("capture"), dict) else {}
-    completeness = (
-        capture.get("completeness") if isinstance(capture.get("completeness"), dict) else {}
-    )
+    completeness = capture.get("completeness") if isinstance(capture.get("completeness"), dict) else {}
     archive = capture.get("archive") if isinstance(capture.get("archive"), dict) else {}
     files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
     return CaptureResult(
@@ -614,7 +614,11 @@ def build_agent_configuration(request: RunRequest) -> tuple[dict[str, str], dict
         temperature = sampling.get("temperature")
         if isinstance(temperature, int | float) and not isinstance(temperature, bool):
             agent_kwargs["temperature"] = float(temperature)
-        forwarded = {key: value for key, value in sampling.items() if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None}
+        forwarded = {
+            key: value
+            for key, value in sampling.items()
+            if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None
+        }
         if forwarded:
             agent_kwargs["llm_call_kwargs"] = forwarded
 
@@ -701,7 +705,9 @@ async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) ->
             health.raise_for_status()
             actual_id = health.json().get("session_server_instance_id")
             if actual_id != request.session_server_instance_id:
-                raise RuntimeError(f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})")
+                raise RuntimeError(
+                    f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})"
+                )
 
         while True:
             try:
@@ -785,7 +791,9 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         trial_task.cancel()
         if monitor_task is not None:
             monitor_task.cancel()
-        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
+        )
         response = RunResponse(exit_status="TimeLimitExceeded")
     except asyncio.CancelledError:
         raise
@@ -797,7 +805,9 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             trial_task.cancel()
         if monitor_task is not None and not monitor_task.done():
             monitor_task.cancel()
-        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
+        )
 
         trial_id = str(trial.id)
         trial_name = str(trial.config.trial_name)
@@ -861,8 +871,7 @@ def create_app(
     def require_bearer(http_request: Request, *tokens: str) -> None:
         expected = [f"Bearer {token}" for token in tokens if token]
         if expected and not any(
-            secrets.compare_digest(http_request.headers.get("authorization", ""), item)
-            for item in expected
+            secrets.compare_digest(http_request.headers.get("authorization", ""), item) for item in expected
         ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
