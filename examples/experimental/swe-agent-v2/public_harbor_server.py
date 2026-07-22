@@ -479,6 +479,7 @@ def stage_trial_capture(
             "step_index": resolved_step_index,
             "session_id": session_id,
             "trial_id": trial_id,
+            "context": request.capture_context,
         }
         manifest = {
             "schema_version": _CAPTURE_SCHEMA_VERSION,
@@ -498,7 +499,6 @@ def stage_trial_capture(
             "source": {
                 "mode": "bridge-hook",
                 **correlation,
-                "context": request.capture_context,
             },
             "files": files,
             "capture": {

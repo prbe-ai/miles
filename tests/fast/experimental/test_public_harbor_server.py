@@ -201,6 +201,7 @@ def test_stage_trial_capture_preserves_native_tree_and_writes_probe_descriptor(t
     assert descriptor["arguments"]["step_index"] == 17
     assert descriptor["arguments"]["expand"] is False
     assert descriptor["correlation"]["probe_run_id"] == "probe-run-1"
+    assert descriptor["correlation"]["context"] == {"mix": "swe-and-terminal"}
 
     with tarfile.open(capture.archive_path, "r:gz") as archive:
         names = set(archive.getnames())
