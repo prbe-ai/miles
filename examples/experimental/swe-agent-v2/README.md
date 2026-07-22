@@ -276,7 +276,7 @@ These are passed as CLI args to `run.sh` (not defaults, since they vary per mode
    - Agent calls back to Miles Router at `OPENAI_API_BASE` for model inference
    - Runs the verifier (`test.sh`) and returns `TrialResult` with reward
 4. **TITO recording**: Miles Router proxies each `/v1/chat/completions` to SGLang and records exact token IDs and logprobs
-5. **Native capture**: after `Trial.run()` returns, the bridge atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes `capture-manifest.json` plus a pending `export-request.json`
+5. **Native capture**: after `Trial.run()` returns, the bridge calls the Probe SDK's producer adapter, which atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes its versioned manifest plus a pending export request
 6. **Sample building**: Records are converted to training `Sample`s with token IDs, logprobs, loss masks
 7. **Training**: GRPO policy update using Megatron, then weights synced back to SGLang engines
 
@@ -299,8 +299,8 @@ export PROBE_TOKEN='<write token>'
 probe trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5
 ```
 
-The bridge does not import the SDK and does not block a rollout on network
-uploads. A stopped watcher or API outage leaves the descriptor and staged bytes
+The bridge uses the SDK only for durable local staging and does not block a
+rollout on network uploads. A stopped watcher or API outage leaves the descriptor and staged bytes
 on the PVC; `probe trial drain "$MILES_HARBOR_CAPTURE_DIR"` resumes them. The
 run ID is supplied automatically by Miles when Probe tracking is enabled, or
 may be supplied as `PROBE_RUN_ID` for a pre-created run.

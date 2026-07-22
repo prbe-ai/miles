@@ -20,12 +20,8 @@ import logging
 import os
 import re
 import secrets
-import shutil
-import tarfile
-import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -51,15 +47,7 @@ _SEQUENCE_EXCEPTIONS = {
     "SequenceLengthLimitExceeded",
 }
 _HOST_AGENTS = {"terminus", "terminus-1", "terminus-2"}
-_CAPTURE_SCHEMA_VERSION = "1.0"
 _EXPECTED_TRIAL_FILES = ("config.json", "lock.json", "result.json")
-_TOP_LEVEL_ROLES = {
-    "config.json": "config",
-    "lock.json": "lock",
-    "result.json": "result",
-    "reward.json": "reward",
-    "trajectory.json": "trajectory",
-}
 
 
 class RunRequest(BaseModel):
@@ -227,165 +215,11 @@ def extract_session_id(base_url: str) -> str | None:
     return unquote(match.group(1)) if match else None
 
 
-def _role_for(relative_path: str) -> str:
-    """Use the same fork-tolerant roles as probe.connectors.harbor."""
-    parts = Path(relative_path).parts
-    if len(parts) == 1 and parts[0] in _TOP_LEVEL_ROLES:
-        return _TOP_LEVEL_ROLES[parts[0]]
-    if not parts:
-        return "other"
-    if parts[0] == "agent" or parts[:2] == ("logs", "agent"):
-        return "agent_log"
-    if parts[0] == "verifier" or parts[:2] == ("logs", "verifier"):
-        return "verifier"
-    if parts[0] == "output":
-        return "output"
-    return "other"
-
-
-def _fingerprint(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-            size += len(chunk)
-    return digest.hexdigest(), size
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _trial_file_inventory(trial_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]], int]:
-    """Inventory every regular file and symlink without following symlinks."""
-    files: list[dict[str, Any]] = []
-    symlinks: list[dict[str, str]] = []
-    total_size = 0
-    for path in sorted(trial_dir.rglob("*"), key=lambda item: item.relative_to(trial_dir).as_posix()):
-        relative = path.relative_to(trial_dir).as_posix()
-        if path.is_symlink():
-            symlinks.append({"path": relative, "target": os.readlink(path)})
-        elif path.is_file():
-            content_hash, size_bytes = _fingerprint(path)
-            files.append(
-                {
-                    "role": _role_for(relative),
-                    "path": relative,
-                    "content_hash": content_hash,
-                    "size_bytes": size_bytes,
-                }
-            )
-            total_size += size_bytes
-    return files, symlinks, total_size
-
-
-def _phase_timings(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    phases: dict[str, dict[str, Any]] = {}
-    for name in ("environment_setup", "agent_setup", "agent_execution", "verifier"):
-        timing = result.get(name)
-        if isinstance(timing, dict):
-            phases[name] = {key: timing.get(key) for key in ("started_at", "finished_at")}
-    return phases
-
-
-def _capture_external_key(trial_id: str, request: RunRequest) -> str:
-    identity = {
-        "miles_run_id": request.miles_run_id,
-        "rollout_id": request.rollout_id,
-        "group_id": request.group_id,
-        "sample_id": request.sample_id,
-        "harbor_trial_id": trial_id,
-    }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    return f"miles-harbor:{hashlib.sha256(encoded).hexdigest()}"
-
-
 def _capture_directory_name(trial_id: str) -> str:
     """Return a collision-resistant basename even for unusual provider IDs."""
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", trial_id).strip("._-")[:80] or "trial"
     suffix = hashlib.sha256(trial_id.encode()).hexdigest()[:12]
     return f"{slug}-{suffix}"
-
-
-def _write_json_durably(path: Path, value: dict[str, Any]) -> None:
-    with path.open("w") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        # Some shared/network filesystems do not implement directory fsync.
-        # File fsync plus atomic rename is the strongest contract they expose.
-        pass
-
-
-def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_tree(root: Path) -> None:
-    """Flush copied bytes and directory entries before publishing the capture."""
-    directories = [root]
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            continue
-        if path.is_dir():
-            directories.append(path)
-        elif path.is_file():
-            _fsync_file(path)
-    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-        _fsync_directory(directory)
-
-
-def _completed_capture(final_dir: Path, *, trial_id: str, external_key: str) -> CaptureResult | None:
-    """Reuse an atomically published capture when staging the same Harbor trial."""
-    manifest_path = final_dir / "capture-manifest.json"
-    archive_path = final_dir / "trial.tar.gz"
-    staged_trial_dir = final_dir / "trial"
-    if not (manifest_path.is_file() and archive_path.is_file() and staged_trial_dir.is_dir()):
-        return None
-    manifest = _load_json(manifest_path)
-    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
-    trial = manifest.get("trial") if isinstance(manifest.get("trial"), dict) else {}
-    if trial.get("id") != trial_id or source.get("external_key") != external_key:
-        return None
-    capture = manifest.get("capture") if isinstance(manifest.get("capture"), dict) else {}
-    completeness = capture.get("completeness") if isinstance(capture.get("completeness"), dict) else {}
-    archive = capture.get("archive") if isinstance(capture.get("archive"), dict) else {}
-    files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
-    return CaptureResult(
-        status=str(completeness.get("status") or "complete"),
-        staged_trial_dir=str(staged_trial_dir),
-        archive_path=str(archive_path),
-        manifest_path=str(manifest_path),
-        export_descriptor_path=str(final_dir / "export-request.json"),
-        archive_content_hash=archive.get("content_hash"),
-        external_key=external_key,
-        file_count=len(files),
-        size_bytes=sum(
-            entry.get("size_bytes", 0)
-            for entry in files
-            if isinstance(entry, dict) and isinstance(entry.get("size_bytes", 0), int)
-        ),
-    )
 
 
 def stage_trial_capture(
@@ -401,176 +235,64 @@ def stage_trial_capture(
     session_id: str | None,
     request: RunRequest,
 ) -> CaptureResult:
-    """Atomically stage Harbor's native trial tree, inventory, and archive.
+    """Call the SDK-owned, non-network Harbor producer adapter."""
+    from probe.connectors.harbor import stage_trial_export
 
-    The staged ``trial/`` directory intentionally remains byte/layout compatible
-    with ``probe.connectors.harbor.capture_trial``. Unknown and binary files are
-    copied without interpretation. Symlinks are preserved in the archive but
-    never followed while hashing, preventing a sandbox-created link from reading
-    files outside the trial directory.
-    """
-    source = trial_dir.expanduser().resolve()
-    if not source.is_dir():
-        raise FileNotFoundError(f"Harbor trial directory does not exist: {source}")
-
-    root = capture_root.expanduser().resolve()
-    if root == source or root.is_relative_to(source):
-        raise ValueError("MILES_HARBOR_CAPTURE_DIR must not be inside a Harbor trial directory")
-    root.mkdir(parents=True, exist_ok=True)
-
-    external_key = _capture_external_key(trial_id, request)
-    final_dir = root / _capture_directory_name(trial_id)
-    if final_dir.exists():
-        existing = _completed_capture(final_dir, trial_id=trial_id, external_key=external_key)
-        if existing is not None:
-            return existing
-        raise FileExistsError(f"Conflicting or incomplete capture exists for Harbor trial {trial_id}: {final_dir}")
-
-    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.", dir=root))
-    try:
-        staged_trial_dir = temporary_dir / "trial"
-        shutil.copytree(source, staged_trial_dir, symlinks=True, copy_function=shutil.copy2)
-        _fsync_tree(staged_trial_dir)
-        files, symlinks, size_bytes = _trial_file_inventory(staged_trial_dir)
-        discovered_paths = {entry["path"] for entry in files}
-        expected_files = [
-            {
-                "path": path,
-                "required": True,
-                "state": "present" if path in discovered_paths else "missing",
-            }
-            for path in _EXPECTED_TRIAL_FILES
-        ]
-        missing_required = [entry["path"] for entry in expected_files if entry["state"] == "missing"]
-        completeness_status = "complete" if not missing_required else "partial"
-
-        archive_path = temporary_dir / "trial.tar.gz"
-        with tarfile.open(archive_path, "w:gz") as archive:
-            archive.add(staged_trial_dir, arcname=source.name, recursive=True)
-        _fsync_file(archive_path)
-        archive_content_hash, _ = _fingerprint(archive_path)
-
-        result = _load_json(staged_trial_dir / "result.json")
-        verifier_result = result.get("verifier_result")
-        rewards = verifier_result.get("rewards") if isinstance(verifier_result, dict) else None
-        reward = None
-        if isinstance(rewards, dict) and rewards:
-            reward = rewards.get("reward", next(iter(rewards.values())))
-        resolved_step_index = request.step_index
-        if resolved_step_index is None and isinstance(request.rollout_id, int):
-            resolved_step_index = request.rollout_id
-        environment = {
-            "type": environment_type,
-            "sandbox_id": sandbox_id,
-            "provider_sandbox_id": provider_sandbox_id,
-            "delete_requested": delete_requested,
-            "collected": {
-                "native_trial_directory": True,
-                "staged_after_trial_run_returned": True,
-            },
-        }
-        correlation = {
-            "external_key": external_key,
-            "probe_run_id": request.run_id,
-            "miles_run_id": request.miles_run_id,
-            "rollout_id": request.rollout_id,
-            "sample_id": request.sample_id,
-            "group_id": request.group_id,
-            "step_index": resolved_step_index,
-            "session_id": session_id,
-            "trial_id": trial_id,
-            "context": request.capture_context,
-        }
-        manifest = {
-            "schema_version": _CAPTURE_SCHEMA_VERSION,
-            "trial": {
-                "id": trial_id,
-                "name": result.get("trial_name") or source.name,
-                "task_name": result.get("task_name") or task_id,
-                "task_id": task_id,
-                "task_checksum": result.get("task_checksum"),
-                "trial_uri": result.get("trial_uri") or source.as_uri(),
-            },
-            "agent": result.get("agent_info"),
-            "verifier": {"reward": reward, "rewards": rewards} if isinstance(rewards, dict) else None,
-            "phases": _phase_timings(result),
-            "environment": environment,
-            "exception": result.get("exception_info"),
-            "source": {
-                "mode": "bridge-hook",
-                **correlation,
-            },
-            "files": files,
-            "capture": {
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "completeness": {
-                    "status": completeness_status,
-                    "scope": "host_harbor_trial_tree",
-                    "inventory_complete": True,
-                    "expected": expected_files,
-                    "missing_required": missing_required,
-                    "sandbox_state_outside_harbor_outputs": "unknown",
-                    "reason": (
-                        "Harbor Trial.run() stops/deletes the sandbox before returning; "
-                        "only files Harbor persisted into its host trial tree are observable."
-                    ),
-                },
-                "archive": {
-                    "path": "trial.tar.gz",
-                    "content_hash": archive_content_hash,
-                },
-                "symlinks": symlinks,
-            },
-        }
-        manifest_path = temporary_dir / "capture-manifest.json"
-        _write_json_durably(manifest_path, manifest)
-
-        # A future exporter can watch these descriptors without importing Probe
-        # into the Harbor service. The staged trial path is directly consumable by
-        # probe.connectors.harbor.capture_trial or `probe trial add`.
-        export_descriptor = {
-            "schema_version": "probe-harbor-export/1",
-            "request_id": external_key,
-            "status": "pending",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "attempts": 0,
-            "last_error": None,
-            "target": {"kind": "probe_run", "run_id": request.run_id},
-            "connector": "probe.connectors.harbor.capture_trial",
-            "arguments": {
-                "trial_dir": "trial",
-                "trial_dir_base": "descriptor_dir",
-                "step_index": resolved_step_index,
-                "environment": environment,
-                "source_mode": "bridge-hook",
-                "expand": False,
-            },
-            "correlation": correlation,
-            "capture_manifest": "capture-manifest.json",
-            "archive": "trial.tar.gz",
-        }
-        export_descriptor_path = temporary_dir / "export-request.json"
-        _write_json_durably(export_descriptor_path, export_descriptor)
-
-        # The directory rename publishes only complete captures. The parent fsync
-        # makes that publication durable on filesystems that implement fsync.
-        _fsync_directory(temporary_dir)
-        os.replace(temporary_dir, final_dir)
-        _fsync_directory(root)
-        return CaptureResult(
-            status=completeness_status,
-            staged_trial_dir=str(final_dir / "trial"),
-            archive_path=str(final_dir / "trial.tar.gz"),
-            manifest_path=str(final_dir / "capture-manifest.json"),
-            export_descriptor_path=str(final_dir / "export-request.json"),
-            archive_content_hash=archive_content_hash,
-            external_key=external_key,
-            file_count=len(files),
-            size_bytes=size_bytes,
-        )
-    except BaseException:
-        shutil.rmtree(temporary_dir, ignore_errors=True)
-        raise
+    resolved_step_index = request.step_index
+    if resolved_step_index is None and isinstance(request.rollout_id, int):
+        resolved_step_index = request.rollout_id
+    environment = {
+        "type": environment_type,
+        "sandbox_id": sandbox_id,
+        "provider_sandbox_id": provider_sandbox_id,
+        "delete_requested": delete_requested,
+        "collected": {
+            "native_trial_directory": True,
+            "staged_after_trial_run_returned": True,
+        },
+    }
+    correlation = {
+        "miles_run_id": request.miles_run_id,
+        "rollout_id": request.rollout_id,
+        "sample_id": request.sample_id,
+        "group_id": request.group_id,
+        "session_id": session_id,
+        "trial_id": trial_id,
+        "task_id": task_id,
+    }
+    destination = capture_root.expanduser().resolve() / _capture_directory_name(trial_id)
+    staged = stage_trial_export(
+        trial_dir,
+        destination,
+        run_id=request.run_id,
+        step_index=resolved_step_index,
+        environment=environment,
+        correlation=correlation,
+        context=request.capture_context,
+        expected_paths=_EXPECTED_TRIAL_FILES,
+        expand=False,
+    )
+    manifest = json.loads(staged.capture_manifest_path.read_text())
+    files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+    capture = manifest.get("capture") if isinstance(manifest.get("capture"), dict) else {}
+    archive = capture.get("archive") if isinstance(capture.get("archive"), dict) else {}
+    completeness = capture.get("completeness") if isinstance(capture.get("completeness"), dict) else {}
+    descriptor_correlation = staged.descriptor.get("correlation") or {}
+    return CaptureResult(
+        status=str(completeness.get("status") or "partial"),
+        staged_trial_dir=str(staged.staged_trial.trial_dir),
+        archive_path=str(staged.archive_path) if staged.archive_path is not None else None,
+        manifest_path=str(staged.capture_manifest_path),
+        export_descriptor_path=str(staged.request_path),
+        archive_content_hash=archive.get("content_hash"),
+        external_key=descriptor_correlation.get("external_key"),
+        file_count=len(files),
+        size_bytes=sum(
+            item.get("size_bytes", 0)
+            for item in files
+            if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)
+        ),
+    )
 
 
 def build_agent_configuration(request: RunRequest) -> tuple[dict[str, str], dict[str, Any]]:

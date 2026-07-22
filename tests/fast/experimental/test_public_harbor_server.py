@@ -174,14 +174,14 @@ def test_stage_trial_capture_preserves_native_tree_and_writes_probe_descriptor(t
     assert source["group_id"] == 9
     assert source["session_id"] == "session-123"
     assert source["trial_id"] == "trial-uuid"
-    assert source["external_key"].startswith("miles-harbor:")
+    assert source["external_key"].startswith("probe:v1:harbor:rollout:")
     assert source["context"] == {"mix": "swe-and-terminal"}
     assert manifest["verifier"] == {"reward": 0.75, "rewards": {"reward": 0.75, "tests": 1.0}}
     assert manifest["environment"]["collected"] == {
         "native_trial_directory": True,
         "staged_after_trial_run_returned": True,
     }
-    assert manifest["capture"]["completeness"]["scope"] == "host_harbor_trial_tree"
+    assert manifest["capture"]["completeness"]["scope"] == "host_trial_directory"
     assert manifest["capture"]["completeness"]["missing_required"] == []
     assert {entry["state"] for entry in manifest["capture"]["completeness"]["expected"]} == {"present"}
     assert manifest["capture"]["completeness"]["sandbox_state_outside_harbor_outputs"] == "unknown"
@@ -205,9 +205,9 @@ def test_stage_trial_capture_preserves_native_tree_and_writes_probe_descriptor(t
 
     with tarfile.open(capture.archive_path, "r:gz") as archive:
         names = set(archive.getnames())
-    assert "task__abc/unknown/native.bin" in names
-    assert "task__abc/.native-state" in names
-    assert "task__abc/latest-result" in names
+    assert "trial/unknown/native.bin" in names
+    assert "trial/.native-state" in names
+    assert "trial/latest-result" in names
 
 
 def test_stage_trial_capture_retry_reuses_completed_capture(tmp_path: Path) -> None:
@@ -353,7 +353,7 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     assert response.session_id == "session-unit"
     assert response.run_id == "run-unit"
     assert response.miles_run_id == "miles-unit"
-    assert response.external_key.startswith("miles-harbor:")
+    assert response.external_key.startswith("probe:v1:harbor:rollout:")
     assert response.rollout_id == response.step_index == 3
     assert response.sample_id == 4
     assert response.group_id == 5
