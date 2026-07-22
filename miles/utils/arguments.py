@@ -1639,6 +1639,92 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        # Research OS / Probe
+        def add_probe_arguments(parser):
+            def env_flag(name: str, default: bool) -> bool:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return default
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+            env_links = [item.strip() for item in os.environ.get("PROBE_LINKS", "").split(",") if item.strip()]
+            env_tags = [item.strip() for item in os.environ.get("PROBE_TAGS", "").split(",") if item.strip()]
+            parser.add_argument(
+                "--use-probe",
+                action="store_true",
+                default=env_flag("MILES_USE_PROBE", False),
+                help="Queue Miles metrics for durable export to Research OS/Probe.",
+            )
+            parser.add_argument(
+                "--probe-base-url",
+                default=os.environ.get("PROBE_BASE_URL"),
+                help="Research OS API URL. Defaults to PROBE_BASE_URL or Probe SDK config.",
+            )
+            parser.add_argument("--probe-project", default=os.environ.get("PROBE_PROJECT", "miles"))
+            parser.add_argument("--probe-experiment", default=os.environ.get("PROBE_EXPERIMENT", "miles"))
+            parser.add_argument(
+                "--probe-hypothesis",
+                default=os.environ.get(
+                    "PROBE_HYPOTHESIS",
+                    "Capture Miles training, rollout, and evaluation telemetry.",
+                ),
+            )
+            parser.add_argument("--probe-run-name", default=os.environ.get("PROBE_RUN_NAME"))
+            parser.add_argument(
+                "--probe-external-id",
+                default=os.environ.get("PROBE_EXTERNAL_ID") or os.environ.get("MILES_RUN_ID"),
+                help="Stable Miles-side run ID; set this to resume an offline durable queue.",
+            )
+            parser.add_argument(
+                "--probe-run-id",
+                default=os.environ.get("PROBE_RUN_ID"),
+                help="Attach to an existing Research OS run instead of creating one.",
+            )
+            parser.add_argument("--probe-tag", action="append", dest="probe_tags", default=env_tags)
+            parser.add_argument(
+                "--probe-link",
+                action="append",
+                dest="probe_links",
+                default=env_links,
+                metavar="KEY=VALUE",
+                help="Attach a native deployment/run identifier; repeat for multiple links.",
+            )
+            parser.add_argument(
+                "--probe-queue-dir",
+                default=os.environ.get("PROBE_QUEUE_DIR"),
+                help="Durable metric queue root. Defaults under --save; use a shared PVC in distributed runs.",
+            )
+            parser.add_argument(
+                "--probe-export-interval-sec",
+                type=float,
+                default=float(os.environ.get("PROBE_EXPORT_INTERVAL_SEC", "2")),
+                help="Seconds between background attempts to drain the durable metric queue.",
+            )
+            parser.add_argument(
+                "--probe-finish-timeout-sec",
+                type=float,
+                default=float(os.environ.get("PROBE_FINISH_TIMEOUT_SEC", "20")),
+                help="Maximum final wait for confirmed exports; pending records remain on disk.",
+            )
+            parser.add_argument(
+                "--probe-snapshot",
+                action=argparse.BooleanOptionalAction,
+                default=env_flag("PROBE_SNAPSHOT", True),
+                help="Capture the primary process's git, dependency, and GPU launch snapshot.",
+            )
+            parser.add_argument(
+                "--probe-snapshot-cwd",
+                default=os.environ.get("PROBE_SNAPSHOT_CWD"),
+                help="Git worktree to snapshot. Defaults to the current working directory.",
+            )
+            parser.add_argument(
+                "--probe-fail-open",
+                action=argparse.BooleanOptionalAction,
+                default=env_flag("PROBE_FAIL_OPEN", True),
+                help="Keep training when export is unavailable; metric records remain on the durable queue.",
+            )
+            return parser
+
         # debug
         def add_debug_arguments(parser):
             parser.add_argument(
@@ -2190,6 +2276,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_mlflow_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_prometheus_arguments(parser)
+        parser = add_probe_arguments(parser)
         parser = add_router_arguments(parser)
         parser = add_debug_arguments(parser)
         parser = add_sglang_arguments(parser)
