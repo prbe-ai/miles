@@ -162,9 +162,12 @@ class TrackingManager:
         for backend in self._backends:
             backend.define_step_key_metric_group(prefix, step_key)
 
-    def finish(self) -> None:
+    def finish(self, status: str = "completed") -> None:
         for backend in self._backends:
             try:
+                set_terminal_status = getattr(backend, "set_terminal_status", None)
+                if callable(set_terminal_status):
+                    set_terminal_status(status)
                 backend.finish()
             except Exception:
                 logger.exception(

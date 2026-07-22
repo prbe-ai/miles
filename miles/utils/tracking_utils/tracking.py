@@ -7,6 +7,7 @@ from miles.utils.audit_utils.event_logger.models import MetricEvent
 
 from .base import MlflowBackend, PrometheusBackend, TensorboardBackend, TrackingBackend, TrackingManager, WandbBackend
 from .ci_history import CiHistoryBackend
+from .probe_utils import ProbeBackend
 
 # The full registry lives here, not base.py: base must never import a backend
 # module (ci_history imports TrackingBackend from base -> circular). This
@@ -17,6 +18,8 @@ BACKEND_REGISTRY: dict[str, tuple[type[TrackingBackend], str]] = {
     "tensorboard": (TensorboardBackend, "use_tensorboard"),
     "mlflow": (MlflowBackend, "use_mlflow"),
     "prometheus": (PrometheusBackend, "use_prometheus"),
+    # Probe starts after incumbent trackers so it can link their native run IDs.
+    "probe": (ProbeBackend, "use_probe"),
     "ci_history": (CiHistoryBackend, "ci_enable_metrics_capture"),
 }
 
@@ -43,5 +46,5 @@ def log(args, metrics, step_key: str):
         get_event_logger().log(MetricEvent, {"metrics": serializable_metrics}, print_log=False)
 
 
-def finish_tracking():
-    _manager.finish()
+def finish_tracking(status: str = "completed"):
+    _manager.finish(status=status)

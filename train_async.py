@@ -112,7 +112,9 @@ async def train(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    terminal_status = "failed"
     try:
         asyncio.run(train(args))
+        terminal_status = "completed"
     finally:
-        finish_tracking()
+        finish_tracking(status=terminal_status)

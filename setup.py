@@ -51,6 +51,9 @@ setup(
         "mlflow": [
             "mlflow>=2.0",
         ],
+        "probe": [
+            "probe-research>=0.6.0; python_version >= '3.11'",
+        ],
     },
     python_requires=">=3.10",
     classifiers=[
