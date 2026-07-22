@@ -89,6 +89,10 @@ class RunRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class FlushRequest(BaseModel):
+    session_server_instance_id: str
+
+
 class CaptureResult(BaseModel):
     status: str = "not_attempted"
     staged_trial_dir: str | None = None
@@ -138,6 +142,7 @@ class Settings:
     request_timeout_sec: float = 14_400.0
     session_poll_interval_sec: float = 5.0
     auth_token: str = ""
+    admin_secret: str = ""
     allowed_callback_hosts: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
     allow_any_callback: bool = False
 
@@ -165,6 +170,7 @@ class Settings:
             request_timeout_sec=float(os.getenv("MILES_HARBOR_REQUEST_TIMEOUT_SEC", "14400")),
             session_poll_interval_sec=float(os.getenv("MILES_HARBOR_SESSION_POLL_INTERVAL_SEC", "5")),
             auth_token=os.getenv("MILES_HARBOR_AUTH_TOKEN", ""),
+            admin_secret=os.getenv("HARBOR_ADMIN_SECRET", ""),
             allowed_callback_hosts=frozenset(host.strip().lower() for host in raw_hosts.split(",") if host.strip()),
             allow_any_callback=_env_bool("MILES_HARBOR_ALLOW_ANY_CALLBACK", False),
         )
@@ -849,7 +855,16 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     semaphore = asyncio.Semaphore(settings.max_concurrent)
+    active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
     app = FastAPI(title="Miles Public Harbor Bridge")
+
+    def require_bearer(http_request: Request, *tokens: str) -> None:
+        expected = [f"Bearer {token}" for token in tokens if token]
+        if expected and not any(
+            secrets.compare_digest(http_request.headers.get("authorization", ""), item)
+            for item in expected
+        ):
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -862,11 +877,7 @@ def create_app(
 
     @app.post("/run", response_model=RunResponse)
     async def run_trial(payload: RunRequest, http_request: Request) -> RunResponse:
-        if settings.auth_token:
-            supplied = http_request.headers.get("authorization", "")
-            expected = f"Bearer {settings.auth_token}"
-            if not secrets.compare_digest(supplied, expected):
-                raise HTTPException(status_code=401, detail="Invalid bearer token")
+        require_bearer(http_request, settings.auth_token)
         try:
             validate_callback_url(payload.base_url, settings)
             if payload.session_server_id:
@@ -878,11 +889,38 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         async with semaphore:
+            task = asyncio.current_task()
+            instance_id = payload.session_server_instance_id
+            if task is not None and instance_id:
+                active_tasks.setdefault(instance_id, set()).add(task)
             try:
                 return await trial_runner(payload, settings)
             except Exception as exc:
                 logger.exception("Harbor trial failed for %s", payload.instance_id)
                 return RunResponse(exit_status=f"Error: {type(exc).__name__}")
+            finally:
+                if task is not None and instance_id:
+                    tasks = active_tasks.get(instance_id)
+                    if tasks is not None:
+                        tasks.discard(task)
+                        if not tasks:
+                            active_tasks.pop(instance_id, None)
+
+    @app.post("/flush")
+    async def flush(payload: FlushRequest, http_request: Request) -> dict[str, Any]:
+        """Cancel in-flight trials for one Miles session-server generation."""
+        require_bearer(http_request, settings.admin_secret or settings.auth_token)
+        tasks = list(active_tasks.get(payload.session_server_instance_id, set()))
+        current = asyncio.current_task()
+        tasks = [task for task in tasks if task is not current and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            "session_server_instance_id": payload.session_server_instance_id,
+            "cancelled": len(tasks),
+        }
 
     return app
 

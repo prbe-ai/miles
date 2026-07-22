@@ -253,6 +253,7 @@ Then open `http://<host>:8081` in a browser.
 | `HARBOR_TRIALS_DIR` | `./trials` | Harbor's native host-side trial output directory |
 | `MILES_HARBOR_CAPTURE_DIR` | sibling `<trials>-captures` | Durable staging directory; set this to a shared PVC in production |
 | `HARBOR_DELETE_ENVIRONMENTS` | `true` | Whether Harbor deletes the sandbox during `Trial.run()` cleanup |
+| `HARBOR_ADMIN_SECRET` | unset | Optional bearer secret for `/flush`; falls back to the bridge auth token |
 | `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Hostname for agent containers to reach Miles Router |
 | `MILES_HOST_IP` | `$(hostname)` | IP/hostname for inter-container communication |
 

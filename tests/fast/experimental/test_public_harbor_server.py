@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -391,6 +392,59 @@ async def test_http_contract_and_auth(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert response.json()["reward"] == 1.0
         assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_cancels_inflight_trial_for_session_server_generation(tmp_path: Path) -> None:
+    _task_dir(tmp_path)
+    settings = server.Settings(
+        tasks_dir=tmp_path / "tasks",
+        auth_token="run-token",
+        admin_secret="admin-token",
+        allowed_callback_hosts=frozenset({"miles.internal"}),
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocking_runner(request, actual_settings):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    app = server.create_app(settings, blocking_runner)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        run_task = asyncio.create_task(
+            client.post(
+                "/run",
+                json={
+                    "base_url": "http://miles.internal:30000/sessions/abc/v1",
+                    "model": "openai/model",
+                    "instance_id": "hello-world",
+                    "session_server_instance_id": "generation-1",
+                },
+                headers={"Authorization": "Bearer run-token"},
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        unauthorized = await client.post(
+            "/flush",
+            json={"session_server_instance_id": "generation-1"},
+            headers={"Authorization": "Bearer run-token"},
+        )
+        assert unauthorized.status_code == 401
+        flushed = await client.post(
+            "/flush",
+            json={"session_server_instance_id": "generation-1"},
+            headers={"Authorization": "Bearer admin-token"},
+        )
+
+        assert flushed.status_code == 200
+        assert flushed.json()["cancelled"] == 1
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        await asyncio.gather(run_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

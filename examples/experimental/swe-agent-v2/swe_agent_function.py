@@ -140,7 +140,10 @@ async def abort(args) -> None:
         return
 
     headers = None
-    admin_secret = os.getenv("HARBOR_ADMIN_SECRET")
+    admin_secret = os.getenv(
+        "HARBOR_ADMIN_SECRET",
+        os.getenv("AGENT_SERVER_AUTH_TOKEN", os.getenv("MILES_HARBOR_AUTH_TOKEN", "")),
+    )
     if admin_secret:
         headers = {"Authorization": f"Bearer {admin_secret}"}
 
