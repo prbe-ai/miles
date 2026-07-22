@@ -138,7 +138,10 @@ def _scrub_string(value: str) -> str:
         return scrubbed
     if not parsed.scheme or not parsed.netloc or not parsed.query:
         return scrubbed
-    query = [(key, "<redacted>" if _is_sensitive_key(key) else item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)]
+    query = [
+        (key, "<redacted>" if _is_sensitive_key(key) else item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+    ]
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
@@ -162,7 +165,9 @@ def _json_safe(value: Any, *, key: str = "") -> Any:
 
 def _capture_config(args) -> dict[str, Any]:
     """Serialize Miles arguments while excluding opaque environment payloads."""
-    return {key: _json_safe(value, key=key) for key, value in vars(args).items() if key.lower() not in _OPAQUE_CONFIG_KEYS}
+    return {
+        key: _json_safe(value, key=key) for key, value in vars(args).items() if key.lower() not in _OPAQUE_CONFIG_KEYS
+    }
 
 
 def _scalar(value: Any) -> float | None:
@@ -395,7 +400,9 @@ class DurableMetricQueue:
 
     def write_status(self, **values: Any) -> None:
         with self._metadata_lock:
-            existing = _read_json(self.root / "export-status.json") if (self.root / "export-status.json").is_file() else {}
+            existing = (
+                _read_json(self.root / "export-status.json") if (self.root / "export-status.json").is_file() else {}
+            )
             _write_json_atomic(
                 self.root / "export-status.json",
                 {"schema_version": QUEUE_SCHEMA_VERSION, **existing, **values, "updated_at": _now()},
@@ -494,7 +501,11 @@ class _MetricExporter:
         )
         try:
             self.queue.recover_inflight()
-            target_ids = {str(record["run_id"]) for path in (*sorted(self.queue.pending.glob("*.json")), *sorted(self.queue.inflight.glob("*.json"))) if (record := _read_json(path)).get("run_id")}
+            target_ids = {
+                str(record["run_id"])
+                for path in (*sorted(self.queue.pending.glob("*.json")), *sorted(self.queue.inflight.glob("*.json")))
+                if (record := _read_json(path)).get("run_id")
+            }
             if target_ids - {str(run.id)}:
                 raise ValueError(f"queue contains records for {sorted(target_ids)}, not exporter run {run.id}")
             self._thread.start()
@@ -635,7 +646,9 @@ class ProbeTracker:
                 run = Run(client, client.get_run(str(self._run_id)))
             else:
                 try:
-                    run = client.run(**{key: value for key, value in run_spec.items() if key not in {"links", "snapshot"}})
+                    run = client.run(
+                        **{key: value for key, value in run_spec.items() if key not in {"links", "snapshot"}}
+                    )
                 except Exception as exc:
                     existing_id = getattr(exc, "existing_id", None)
                     if not existing_id or getattr(exc, "deleted", False):
