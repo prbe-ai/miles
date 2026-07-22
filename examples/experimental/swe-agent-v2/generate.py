@@ -47,6 +47,18 @@ def _collect_values(all_metrics: list[dict], key: str) -> list[float]:
     return [m.get(key, 0) for m in all_metrics]
 
 
+def _collect_present_numbers(all_metrics: list[dict], key: str) -> list[float]:
+    """Keep mixed client stacks from turning an absent metric into a false zero."""
+    return [
+        float(value)
+        for metric in all_metrics
+        if key in metric
+        and (value := metric[key]) is not None
+        and isinstance(value, int | float)
+        and not isinstance(value, bool)
+    ]
+
+
 def _agg_mean(metrics: dict, all_metrics: list[dict], keys: list[str], prefix: str = "agent/", suffix: str = "_mean"):
     for key in keys:
         values = _collect_values(all_metrics, key)
@@ -71,6 +83,14 @@ def aggregate_agent_metrics(samples: list[Sample]) -> dict:
         if values:
             metrics[f"agent/{key}_mean"] = sum(values) / len(values)
             metrics[f"agent/{key}_sum"] = sum(values)
+
+    # Harbor exposes these on AgentResult. Keep both totals (run accounting)
+    # and means (per-trial comparison) at the Miles rollout step.
+    for key in ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd"):
+        values = _collect_present_numbers(all_metrics, key)
+        if values:
+            metrics[f"agent/{key}_sum"] = sum(values)
+            metrics[f"agent/{key}_mean"] = sum(values) / len(values)
 
     _agg_mean(metrics, all_metrics, ["model_query_time_sum", "env_execution_time_sum", "eval_time", "agent_run_time"])
     _agg_mean(metrics, all_metrics, ["time_per_turn", "model_query_time_avg", "env_execution_time_avg"], suffix="")

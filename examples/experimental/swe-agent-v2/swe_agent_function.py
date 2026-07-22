@@ -11,6 +11,7 @@ differentiation (environment, grading harness, agent selection).
 """
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
@@ -19,6 +20,51 @@ from urllib.parse import urlparse, urlsplit, urlunparse
 from miles.utils.http_utils import post
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_CONTEXT_KEYS = {
+    "client_id",
+    "customer_id",
+    "data_mix",
+    "data_mix_id",
+    "data_source_id",
+    "dataset",
+    "dataset_id",
+    "dataset_name",
+    "dataset_split",
+    "mix",
+    "mix_id",
+    "osmosis_dataset_id",
+    "osmosis_mix_id",
+    "split",
+    "task_type",
+}
+_CAPTURE_CONTEXT_PREFIXES = ("data_mix_", "dataset_", "osmosis_")
+
+
+def _capture_context(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Lift bounded mix/dataset identity into the stack-agnostic descriptor."""
+    explicit = metadata.get("capture_context")
+    candidates = list(explicit.items()) if isinstance(explicit, dict) else []
+    candidates.extend(metadata.items())
+    context: dict[str, Any] = {}
+    for key, value in candidates:
+        if not isinstance(key, str):
+            continue
+        normalized = key.lower()
+        is_explicit = isinstance(explicit, dict) and key in explicit
+        if (
+            not is_explicit
+            and normalized not in _CAPTURE_CONTEXT_KEYS
+            and not normalized.startswith(_CAPTURE_CONTEXT_PREFIXES)
+        ):
+            continue
+        try:
+            encoded = json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        if len(encoded.encode()) <= 4096:
+            context.setdefault(key, value)
+    return context
 
 
 async def run(
@@ -40,6 +86,12 @@ async def run(
         "AGENT_MODEL_NAME",
         os.getenv("SWE_AGENT_MODEL_NAME", "model"),
     )
+    auth_token = os.getenv(
+        "AGENT_SERVER_AUTH_TOKEN",
+        os.getenv("MILES_HARBOR_AUTH_TOKEN", ""),
+    )
+    server_timeout_sec = float(os.getenv("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_api_key = os.getenv("MILES_SESSION_API_KEY", "")
 
     session_url = f"{base_url}/v1"
     external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
@@ -54,7 +106,10 @@ async def run(
         "base_url": session_url,
         "model": f"openai/{model_name}",
         "sampling_params": request_kwargs,
+        "api_key": session_api_key or "dummy",
     }
+    if capture_context := _capture_context(metadata):
+        request["capture_context"] = capture_context
 
     max_seq_len = metadata.get("max_seq_len")
     if max_seq_len is not None:
@@ -73,11 +128,15 @@ async def run(
 
     try:
         response = await asyncio.wait_for(
-            post(f"{agent_server_url}/run", request),
-            timeout=3600,  # 1 hour max per trial
+            post(
+                f"{agent_server_url}/run",
+                request,
+                headers={"Authorization": f"Bearer {auth_token}"} if auth_token else None,
+            ),
+            timeout=server_timeout_sec,
         )
     except asyncio.TimeoutError:
-        logger.error("Agent server call timed out after 3600s")
+        logger.error("Agent server call timed out after %ss", server_timeout_sec)
         return None
     except asyncio.CancelledError:
         logger.warning("Agent server call cancelled (sibling task failure?)")
@@ -86,12 +145,32 @@ async def run(
         logger.error(f"Agent server call failed: {e}")
         return None
 
-    return {
+    result = {
         "reward": response.get("reward", 0.0),
         "exit_status": response.get("exit_status", ""),
         "eval_report": response.get("eval_report", {}),
         "agent_metrics": response.get("agent_metrics", {}),
     }
+    for key in (
+        "trial_id",
+        "trial_name",
+        "task_id",
+        "sandbox_id",
+        "provider_sandbox_id",
+        "session_id",
+        "trial_dir",
+        "external_key",
+        "run_id",
+        "miles_run_id",
+        "rollout_id",
+        "sample_id",
+        "group_id",
+        "step_index",
+        "capture",
+    ):
+        if key in response:
+            result[key] = response[key]
+    return result
 
 
 async def abort(args) -> None:
@@ -109,7 +188,10 @@ async def abort(args) -> None:
         return
 
     headers = None
-    admin_secret = os.getenv("HARBOR_ADMIN_SECRET")
+    admin_secret = os.getenv(
+        "HARBOR_ADMIN_SECRET",
+        os.getenv("AGENT_SERVER_AUTH_TOKEN", os.getenv("MILES_HARBOR_AUTH_TOKEN", "")),
+    )
     if admin_secret:
         headers = {"Authorization": f"Bearer {admin_secret}"}
 

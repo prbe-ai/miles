@@ -58,7 +58,24 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     max_seq_len = getattr(input.args, "max_seq_len", None)
 
-    metadata = input.sample.metadata
+    metadata = dict(input.sample.metadata)
+    sample_id = getattr(input.sample, "index", None)
+    if sample_id is not None:
+        metadata.setdefault("sample_id", sample_id)
+    group_id = getattr(input.sample, "group_index", None)
+    if group_id is not None:
+        metadata.setdefault("group_id", group_id)
+    if input.rollout_id is not None:
+        metadata.setdefault("rollout_id", input.rollout_id)
+        metadata.setdefault("step_index", input.rollout_id)
+    for attr_name in ("probe_run_id", "research_os_run_id"):
+        probe_run_id = getattr(input.args, attr_name, None)
+        if probe_run_id:
+            metadata.setdefault("run_id", probe_run_id)
+            break
+    miles_run_id = getattr(input.args, "miles_run_id", None)
+    if miles_run_id:
+        metadata.setdefault("miles_run_id", miles_run_id)
     if max_seq_len is not None:
         metadata = {**metadata, "max_seq_len": max_seq_len}
     if tracer.session_server_instance_id:

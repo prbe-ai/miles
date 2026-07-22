@@ -60,7 +60,7 @@ async def get_worker_urls(args: Namespace):
         return [worker["url"] for worker in response["workers"]]
 
 
-def submit_generate_tasks(state: GenerateState, samples: list[list[Sample]]):
+def submit_generate_tasks(state: GenerateState, samples: list[list[Sample]], rollout_id: int):
     return [
         asyncio.create_task(
             # submit a group of samples as a single task.
@@ -69,6 +69,7 @@ def submit_generate_tasks(state: GenerateState, samples: list[list[Sample]]):
                 group,
                 sampling_params=state.sampling_params.copy(),
                 evaluation=False,
+                rollout_id=rollout_id,
             )
         )
         for group in samples
@@ -100,7 +101,7 @@ async def generate_rollout_async(
         while len(data) + len(pendings) < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
-            pendings.update(submit_generate_tasks(state, samples))
+            pendings.update(submit_generate_tasks(state, samples, rollout_id))
 
         # wait for the generation to finish
         logger.debug(f"[rollout] Waiting on {len(pendings)} pending tasks, data={len(data)}/{target_data_size}")

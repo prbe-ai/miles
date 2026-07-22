@@ -25,6 +25,8 @@ async def eval_rollout_single_dataset(
     state: GenerateState,
     dataset_cfg: EvalDatasetConfig,
     prompt_dataset_cache: dict[Any, Dataset],
+    *,
+    rollout_id: int | None = None,
 ) -> dict[str, dict[str, list[Any]]]:
     args = state.args
     assert not args.group_rm, "Group RM is not supported for eval rollout"
@@ -81,6 +83,7 @@ async def eval_rollout_single_dataset(
                         sample,
                         sampling_params=sampling_params,
                         evaluation=True,
+                        rollout_id=rollout_id,
                     )
                 )
             )
