@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import shutil
 import sys
-import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -26,6 +26,57 @@ def _task_dir(tmp_path: Path) -> Path:
     task = tmp_path / "tasks" / "hello-world"
     task.mkdir(parents=True)
     return task
+
+
+def _install_fake_probe(monkeypatch):
+    """Install the SDK boundary double; SDK contract behavior is tested upstream."""
+    seen = {}
+
+    def stage_trial_export(trial_dir, destination, **kwargs):
+        seen.update({"trial_dir": Path(trial_dir), "destination": Path(destination), **kwargs})
+        root = Path(destination)
+        staged_trial = root / "trial"
+        root.mkdir(parents=True)
+        shutil.copytree(trial_dir, staged_trial, symlinks=True)
+        files = [
+            {"path": str(path.relative_to(staged_trial)), "size_bytes": path.stat().st_size}
+            for path in staged_trial.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        ]
+        manifest_path = root / "capture-manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "files": files,
+                    "capture": {
+                        "completeness": {"status": "complete"},
+                        "archive": {"content_hash": "a" * 64},
+                    },
+                }
+            )
+        )
+        request_path = root / "export-request.json"
+        external_key = "probe:v1:harbor:rollout:test"
+        descriptor = {"correlation": {"external_key": external_key}}
+        request_path.write_text(json.dumps(descriptor))
+        archive_path = root / "trial.tar.gz"
+        archive_path.write_bytes(b"recovery")
+        return SimpleNamespace(
+            staged_trial=SimpleNamespace(trial_dir=staged_trial),
+            capture_manifest_path=manifest_path,
+            request_path=request_path,
+            descriptor=descriptor,
+            archive_path=archive_path,
+        )
+
+    probe_module = ModuleType("probe")
+    connectors_module = ModuleType("probe.connectors")
+    harbor_module = ModuleType("probe.connectors.harbor")
+    harbor_module.stage_trial_export = stage_trial_export
+    monkeypatch.setitem(sys.modules, "probe", probe_module)
+    monkeypatch.setitem(sys.modules, "probe.connectors", connectors_module)
+    monkeypatch.setitem(sys.modules, "probe.connectors.harbor", harbor_module)
+    return seen
 
 
 def test_resolve_task_path_rejects_traversal(tmp_path: Path) -> None:
@@ -107,7 +158,8 @@ def test_normalize_trial_result() -> None:
     assert response.agent_metrics["agent_run_time"] == 2.0
 
 
-def test_stage_trial_capture_preserves_native_tree_and_writes_probe_descriptor(tmp_path: Path) -> None:
+def test_stage_trial_capture_delegates_native_values_to_probe_sdk(tmp_path: Path, monkeypatch) -> None:
+    seen = _install_fake_probe(monkeypatch)
     trial_dir = tmp_path / "trials" / "task__abc"
     (trial_dir / "agent" / "commands").mkdir(parents=True)
     (trial_dir / "verifier").mkdir()
@@ -163,71 +215,22 @@ def test_stage_trial_capture_preserves_native_tree_and_writes_probe_descriptor(t
     assert (staged_trial / "unknown" / "native.bin").read_bytes() == native_bytes
     assert (staged_trial / "latest-result").is_symlink()
 
-    manifest = json.loads(Path(capture.manifest_path).read_text())
-    assert manifest["schema_version"] == "1.0"
-    source = manifest["source"]
-    assert source["mode"] == "bridge-hook"
-    assert source["probe_run_id"] == "probe-run-1"
-    assert source["miles_run_id"] == "miles-run-1"
-    assert source["rollout_id"] == source["step_index"] == 17
-    assert source["sample_id"] == 41
-    assert source["group_id"] == 9
-    assert source["session_id"] == "session-123"
-    assert source["trial_id"] == "trial-uuid"
-    assert source["external_key"].startswith("probe:v1:harbor:rollout:")
-    assert source["context"] == {"mix": "swe-and-terminal"}
-    assert manifest["verifier"] == {"reward": 0.75, "rewards": {"reward": 0.75, "tests": 1.0}}
-    assert manifest["environment"]["collected"] == {
+    assert seen["run_id"] == "probe-run-1"
+    assert seen["step_index"] == 17
+    assert seen["correlation"] == {
+        "miles_run_id": "miles-run-1",
+        "rollout_id": 17,
+        "sample_id": 41,
+        "group_id": 9,
+        "session_id": "session-123",
+        "trial_id": "trial-uuid",
+        "task_id": "task",
+    }
+    assert seen["context"] == {"mix": "swe-and-terminal"}
+    assert seen["environment"]["collected"] == {
         "native_trial_directory": True,
         "staged_after_trial_run_returned": True,
     }
-    assert manifest["capture"]["completeness"]["scope"] == "host_trial_directory"
-    assert manifest["capture"]["completeness"]["missing_required"] == []
-    assert {entry["state"] for entry in manifest["capture"]["completeness"]["expected"]} == {"present"}
-    assert manifest["capture"]["completeness"]["sandbox_state_outside_harbor_outputs"] == "unknown"
-    by_path = {entry["path"]: entry for entry in manifest["files"]}
-    assert by_path["agent/commands/stdout.log"]["role"] == "agent_log"
-    assert by_path["unknown/native.bin"]["role"] == "other"
-    assert len(by_path["unknown/native.bin"]["content_hash"]) == 64
-    assert manifest["capture"]["symlinks"] == [{"path": "latest-result", "target": "result.json"}]
-
-    descriptor = json.loads(Path(capture.export_descriptor_path).read_text())
-    assert descriptor["schema_version"] == "probe-harbor-export/1"
-    assert descriptor["request_id"] == source["external_key"]
-    assert descriptor["target"] == {"kind": "probe_run", "run_id": "probe-run-1"}
-    assert descriptor["connector"] == "probe.connectors.harbor.capture_trial"
-    assert descriptor["arguments"]["trial_dir"] == "trial"
-    assert descriptor["arguments"]["trial_dir_base"] == "descriptor_dir"
-    assert descriptor["arguments"]["step_index"] == 17
-    assert descriptor["arguments"]["expand"] is False
-    assert descriptor["correlation"]["probe_run_id"] == "probe-run-1"
-    assert descriptor["correlation"]["context"] == {"mix": "swe-and-terminal"}
-
-    with tarfile.open(capture.archive_path, "r:gz") as archive:
-        names = set(archive.getnames())
-    assert "trial/unknown/native.bin" in names
-    assert "trial/.native-state" in names
-    assert "trial/latest-result" in names
-
-
-def test_stage_trial_capture_retry_reuses_completed_capture(tmp_path: Path) -> None:
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    (trial_dir / "result.json").write_text("{}")
-    request = server.RunRequest(base_url="http://localhost/v1", model="model", instance_id="task")
-    kwargs = {
-        "trial_id": "same-id",
-        "task_id": "task",
-        "environment_type": "docker",
-        "delete_requested": True,
-        "sandbox_id": None,
-        "provider_sandbox_id": None,
-        "session_id": None,
-        "request": request,
-    }
-    first = server.stage_trial_capture(trial_dir, tmp_path / "captures", **kwargs)
-    second = server.stage_trial_capture(trial_dir, tmp_path / "captures", **kwargs)
-    assert second == first
 
 
 def test_capture_directory_name_cannot_escape_or_collapse_provider_ids() -> None:
@@ -237,34 +240,9 @@ def test_capture_directory_name_cannot_escape_or_collapse_provider_ids() -> None
     assert first != second
 
 
-def test_stage_trial_capture_reports_missing_standard_files(tmp_path: Path) -> None:
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    (trial_dir / "fork-only.log").write_text("still captured")
-    capture = server.stage_trial_capture(
-        trial_dir,
-        tmp_path / "captures",
-        trial_id="partial-id",
-        task_id="task",
-        environment_type="private-fork",
-        delete_requested=True,
-        sandbox_id=None,
-        provider_sandbox_id=None,
-        session_id=None,
-        request=server.RunRequest(base_url="http://localhost/v1", model="model", instance_id="task"),
-    )
-    manifest = json.loads(Path(capture.manifest_path).read_text())
-    assert capture.status == "partial"
-    assert manifest["capture"]["completeness"]["missing_required"] == [
-        "config.json",
-        "lock.json",
-        "result.json",
-    ]
-    assert manifest["files"][0]["path"] == "fork-only.log"
-
-
 @pytest.mark.asyncio
 async def test_trial_response_carries_correlation_and_completed_capture(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_probe(monkeypatch)
     task_dir = _task_dir(tmp_path)
 
     class Config:
