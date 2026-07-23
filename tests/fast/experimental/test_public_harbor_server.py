@@ -106,6 +106,17 @@ def test_extract_session_id() -> None:
     assert server.extract_session_id("https://api.example.com/v1") is None
 
 
+def test_capture_mode_defaults_off_and_rejects_unknown_values(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("MILES_HARBOR_CAPTURE_MODE", raising=False)
+    monkeypatch.setenv("HARBOR_TRIALS_DIR", str(tmp_path / "trials"))
+    settings = server.Settings.from_env()
+    assert settings.capture_mode == "off"
+    assert settings.capture_dir == tmp_path / "trials-captures"
+
+    with pytest.raises(ValueError, match="MILES_HARBOR_CAPTURE_MODE"):
+        server.Settings(capture_mode="best-effort")
+
+
 def test_build_mini_swe_agent_configuration() -> None:
     request = server.RunRequest(
         base_url="http://miles:30000/sessions/abc/v1",
@@ -307,20 +318,19 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
         tasks_dir=task_dir.parent,
         trials_dir=tmp_path / "trials",
         capture_dir=tmp_path / "captures",
+        capture_mode="shadow",
     )
-    response = await server.run_public_harbor_trial(
-        server.RunRequest(
-            base_url="http://miles.internal:30000/sessions/session-unit/v1",
-            model="openai/model",
-            instance_id="hello-world",
-            run_id="run-unit",
-            miles_run_id="miles-unit",
-            rollout_id=3,
-            sample_id=4,
-            group_id=5,
-        ),
-        settings,
+    request = server.RunRequest(
+        base_url="http://miles.internal:30000/sessions/session-unit/v1",
+        model="openai/model",
+        instance_id="hello-world",
+        run_id="run-unit",
+        miles_run_id="miles-unit",
+        rollout_id=3,
+        sample_id=4,
+        group_id=5,
     )
+    response = await server.run_public_harbor_trial(request, settings)
 
     assert response.reward == 1.0
     assert response.trial_id == "trial-unit-id"
@@ -337,6 +347,54 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     assert response.group_id == 5
     assert response.capture.status == "complete"
     assert Path(response.capture.staged_trial_dir, "agent", "native.log").read_text() == "native agent log"
+
+    def fail_if_staged(*args, **kwargs):
+        raise RuntimeError("capture unavailable")
+
+    monkeypatch.setattr(server, "stage_trial_capture", fail_if_staged)
+    off_capture_dir = tmp_path / "off-captures"
+    off_response = await server.run_public_harbor_trial(
+        request,
+        server.Settings(
+            tasks_dir=task_dir.parent,
+            trials_dir=tmp_path / "off-trials",
+            capture_dir=off_capture_dir,
+            capture_mode="off",
+        ),
+    )
+    assert off_response.reward == 1.0
+    assert off_response.exit_status == "Submitted"
+    assert off_response.capture is None
+    assert off_response.trial_id is None
+    assert not off_capture_dir.exists()
+
+    shadow_failure = await server.run_public_harbor_trial(
+        request,
+        server.Settings(
+            tasks_dir=task_dir.parent,
+            trials_dir=tmp_path / "shadow-failure-trials",
+            capture_dir=tmp_path / "shadow-failure-captures",
+            capture_mode="shadow",
+        ),
+    )
+    assert shadow_failure.reward == 1.0
+    assert shadow_failure.exit_status == "Submitted"
+    assert shadow_failure.capture.status == "failed"
+    assert shadow_failure.capture.error == "RuntimeError: capture unavailable"
+
+    required_response = await server.run_public_harbor_trial(
+        request,
+        server.Settings(
+            tasks_dir=task_dir.parent,
+            trials_dir=tmp_path / "required-trials",
+            capture_dir=tmp_path / "required-captures",
+            capture_mode="required",
+        ),
+    )
+    assert required_response.reward == 1.0
+    assert required_response.exit_status == "Error: CaptureRequiredError"
+    assert required_response.capture.status == "failed"
+    assert required_response.capture.error == "RuntimeError: capture unavailable"
 
 
 @pytest.mark.asyncio
@@ -358,6 +416,8 @@ async def test_http_contract_and_auth(tmp_path: Path) -> None:
         health = await client.get("/health")
         assert health.status_code == 200
         assert health.json()["status"] == "ok"
+        assert health.json()["capture_mode"] == "off"
+        assert "capture_dir" not in health.json()
 
         payload = {
             "base_url": "http://miles.internal:30000/sessions/abc/v1",

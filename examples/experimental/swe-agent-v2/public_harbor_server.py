@@ -48,6 +48,7 @@ _SEQUENCE_EXCEPTIONS = {
 }
 _HOST_AGENTS = {"terminus", "terminus-1", "terminus-2"}
 _EXPECTED_TRIAL_FILES = ("config.json", "lock.json", "result.json")
+_CAPTURE_MODES = frozenset({"off", "shadow", "required"})
 
 
 class RunRequest(BaseModel):
@@ -115,7 +116,7 @@ class RunResponse(BaseModel):
     sample_id: int | str | None = None
     group_id: int | str | None = None
     step_index: int | None = None
-    capture: CaptureResult = Field(default_factory=CaptureResult)
+    capture: CaptureResult | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,7 @@ class Settings:
     tasks_dir: Path = Path("/root/harbor_tasks")
     trials_dir: Path = Path("./trials")
     capture_dir: Path = Path("./trial-captures")
+    capture_mode: str = "off"
     environment_type: str = "docker"
     environment_kwargs: dict[str, Any] = field(default_factory=dict)
     delete_environments: bool = True
@@ -133,6 +135,11 @@ class Settings:
     admin_secret: str = ""
     allowed_callback_hosts: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
     allow_any_callback: bool = False
+
+    def __post_init__(self) -> None:
+        if self.capture_mode not in _CAPTURE_MODES:
+            choices = ", ".join(sorted(_CAPTURE_MODES))
+            raise ValueError(f"MILES_HARBOR_CAPTURE_MODE must be one of: {choices}")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -151,6 +158,7 @@ class Settings:
             tasks_dir=Path(os.getenv("HARBOR_TASKS_DIR", "/root/harbor_tasks")),
             trials_dir=trials_dir,
             capture_dir=Path(os.getenv("MILES_HARBOR_CAPTURE_DIR", str(default_capture_dir))),
+            capture_mode=os.getenv("MILES_HARBOR_CAPTURE_MODE", "off").strip().lower(),
             environment_type=os.getenv("HARBOR_ENVIRONMENT_TYPE", "docker"),
             environment_kwargs=environment_kwargs,
             delete_environments=_env_bool("HARBOR_DELETE_ENVIRONMENTS", True),
@@ -507,6 +515,12 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         )
 
     response: RunResponse | None = None
+    capture: CaptureResult | None = None
+    trial_id: str | None = None
+    trial_name: str | None = None
+    trial_dir: Path | None = None
+    sandbox_id: str | None = None
+    provider_sandbox_id: str | None = None
     try:
         response = await asyncio.wait_for(wait_for_trial(), timeout=settings.request_timeout_sec)
     except TimeoutError:
@@ -531,32 +545,40 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
         )
 
-        trial_id = str(trial.id)
-        trial_name = str(trial.config.trial_name)
-        trial_dir = Path(trial.paths.trial_dir).expanduser().resolve()
-        sandbox_id, provider_sandbox_id = _sandbox_correlation(trial)
-        try:
-            capture = await asyncio.to_thread(
-                stage_trial_capture,
-                trial_dir,
-                settings.capture_dir,
-                trial_id=trial_id,
-                task_id=request.instance_id,
-                environment_type=settings.environment_type,
-                delete_requested=settings.delete_environments,
-                sandbox_id=sandbox_id,
-                provider_sandbox_id=provider_sandbox_id,
-                session_id=extract_session_id(request.base_url),
-                request=request,
-            )
-        except Exception as exc:
-            logger.exception("Failed to stage Harbor trial capture %s", trial_id)
-            capture = CaptureResult(status="failed", error=f"{type(exc).__name__}: {exc}")
+        if settings.capture_mode != "off":
+            trial_id = str(trial.id)
+            trial_name = str(trial.config.trial_name)
+            trial_dir = Path(trial.paths.trial_dir).expanduser().resolve()
+            sandbox_id, provider_sandbox_id = _sandbox_correlation(trial)
+            try:
+                capture = await asyncio.to_thread(
+                    stage_trial_capture,
+                    trial_dir,
+                    settings.capture_dir,
+                    trial_id=trial_id,
+                    task_id=request.instance_id,
+                    environment_type=settings.environment_type,
+                    delete_requested=settings.delete_environments,
+                    sandbox_id=sandbox_id,
+                    provider_sandbox_id=provider_sandbox_id,
+                    session_id=extract_session_id(request.base_url),
+                    request=request,
+                )
+            except Exception as exc:
+                logger.exception("Failed to stage Harbor trial capture %s", trial_id)
+                capture = CaptureResult(status="failed", error=f"{type(exc).__name__}: {exc}")
 
     assert response is not None
+    if settings.capture_mode == "off":
+        return response
+
+    assert trial_id is not None and trial_name is not None and trial_dir is not None
+    assert capture is not None
     resolved_step_index = request.step_index
     if resolved_step_index is None and isinstance(request.rollout_id, int):
         resolved_step_index = request.rollout_id
+    if settings.capture_mode == "required" and capture.status != "complete":
+        response = response.model_copy(update={"exit_status": "Error: CaptureRequiredError"})
     return response.model_copy(
         update={
             "trial_id": trial_id,
@@ -599,14 +621,17 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {
+        result = {
             "status": "ok",
             "environment_type": settings.environment_type,
             "max_concurrent": settings.max_concurrent,
-            "capture_dir": str(settings.capture_dir.expanduser().resolve()),
+            "capture_mode": settings.capture_mode,
         }
+        if settings.capture_mode != "off":
+            result["capture_dir"] = str(settings.capture_dir.expanduser().resolve())
+        return result
 
-    @app.post("/run", response_model=RunResponse)
+    @app.post("/run", response_model=RunResponse, response_model_exclude_none=True)
     async def run_trial(payload: RunRequest, http_request: Request) -> RunResponse:
         require_bearer(http_request, settings.auth_token)
         try:

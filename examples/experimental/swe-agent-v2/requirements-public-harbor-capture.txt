@@ -1,0 +1,2 @@
+-r requirements-public-harbor-server.txt
+probe-research>=0.8.0

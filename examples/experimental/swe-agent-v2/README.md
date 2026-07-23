@@ -251,6 +251,7 @@ Then open `http://<host>:8081` in a browser.
 | `AGENT_MAX_CONCURRENT` | `8` | Max concurrent Harbor trials |
 | `HARBOR_TASKS_DIR` | `/root/harbor_tasks` | Root directory containing task subdirectories |
 | `HARBOR_TRIALS_DIR` | `./trials` | Harbor's native host-side trial output directory |
+| `MILES_HARBOR_CAPTURE_MODE` | `off` | `off`, fail-open local `shadow`, or fail-closed `required` capture |
 | `MILES_HARBOR_CAPTURE_DIR` | sibling `<trials>-captures` | Durable staging directory; set this to a shared PVC in production |
 | `HARBOR_DELETE_ENVIRONMENTS` | `true` | Whether Harbor deletes the sandbox during `Trial.run()` cleanup |
 | `HARBOR_ADMIN_SECRET` | unset | Optional bearer secret for `/flush`; falls back to the bridge auth token |
@@ -276,11 +277,28 @@ These are passed as CLI args to `run.sh` (not defaults, since they vary per mode
    - Agent calls back to Miles Router at `OPENAI_API_BASE` for model inference
    - Runs the verifier (`test.sh`) and returns `TrialResult` with reward
 4. **TITO recording**: Miles Router proxies each `/v1/chat/completions` to SGLang and records exact token IDs and logprobs
-5. **Native capture**: after `Trial.run()` returns, the bridge calls the Probe SDK's producer adapter, which atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes its versioned manifest plus a pending export request
+5. **Native capture (opt-in)**: in `shadow` or `required` mode, after `Trial.run()` returns, the bridge calls the Probe SDK's producer adapter, which atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes its versioned manifest plus a pending export request
 6. **Sample building**: Records are converted to training `Sample`s with token IDs, logprobs, loss masks
 7. **Training**: GRPO policy update using Megatron, then weights synced back to SGLang engines
 
 ### Native Harbor capture boundary
+
+Capture is off by default, with no Probe import, capture-directory creation, or
+capture/correlation fields added to the `/run` response. Install the optional
+capture dependencies and select a mode:
+
+```bash
+pip install -r requirements-public-harbor-capture.txt
+export MILES_HARBOR_CAPTURE_MODE=shadow
+export MILES_HARBOR_CAPTURE_DIR=/durable/trial-captures
+```
+
+`shadow` stages locally but never changes a successful Harbor rollout into a
+failure when staging fails; the response reports `capture.status=failed`.
+`required` performs the same local staging but changes `exit_status` to
+`Error: CaptureRequiredError` when the capture is failed or incomplete. Neither
+mode uploads on the request path. The separate watcher performs network
+publication.
 
 Set `MILES_HARBOR_CAPTURE_DIR` to a shared PVC. Each completed capture contains
 `trial/` (directly consumable by `probe.connectors.harbor.capture_trial`),
