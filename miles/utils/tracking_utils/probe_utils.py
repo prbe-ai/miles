@@ -29,9 +29,26 @@ class ProbeBackend(TrackingBackend):
         self._backend = MilesMetricBackend()
         self._backend.init(args, primary=primary, **kwargs)
 
-    def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int | None = None,
+        *,
+        step_key: str | None = None,
+        **kwargs,
+    ) -> None:
         if self._backend is not None:
-            self._backend.log(metrics, step=step, **kwargs)
+            self._backend.log(metrics, step=step, step_key=step_key, **kwargs)
+
+    def define_step_key_metric_group(self, prefix: str, step_key: str) -> None:
+        if self._backend is None:
+            return
+        # Step-group declarations are useful for dynamic metric namespaces
+        # such as multi-LoRA. Keep compatibility with older SDK releases,
+        # which classify each log from its per-call ``step_key`` only.
+        define_group = getattr(self._backend, "define_step_key_metric_group", None)
+        if callable(define_group):
+            define_group(prefix, step_key)
 
     def set_terminal_status(self, status: str) -> None:
         self._terminal_status = status
