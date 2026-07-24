@@ -806,7 +806,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     if settings.sandbox_state:
-        _install_hint = "MILES_SANDBOX_STATE=1 needs probe-research >= 0.9.0 with the packaged probe-sandbox-snapshot binaries. Install from git per requirements-public-harbor-capture.txt (the pins on PyPI, latest 0.8.2, do not carry the binaries)."
+        _install_hint = "MILES_SANDBOX_STATE=1 needs probe-research >= 0.9.1 with the packaged probe-sandbox-snapshot binaries. Install from git per requirements-public-harbor-capture.txt (PyPI's 0.9.0 does not carry the binaries)."
         try:
             from probe.connectors import sandbox_state as _sandbox_state
         except ImportError as exc:
