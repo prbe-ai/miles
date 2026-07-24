@@ -51,8 +51,15 @@ class ScriptArgs(U.ExecuteTrainConfig):
         "AGENT_SERVER_URL", os.environ.get("SWE_AGENT_URL", "http://agent_env:11000")
     )
     agent_model_name: str = os.environ.get("AGENT_MODEL_NAME", "model")
+    agent_server_auth_token: str = os.environ.get(
+        "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+    )
+    agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
+    session_server_bind_ip: str = os.environ.get("MILES_SESSION_SERVER_BIND_IP", "")
     harbor_tasks_dir: str = os.environ.get("HARBOR_TASKS_DIR", "/root/harbor_tasks")
     router_external_host: str = os.environ.get("MILES_ROUTER_EXTERNAL_HOST", socket.gethostname())  # public IP
+    router_external_base_url: str = os.environ.get("MILES_ROUTER_EXTERNAL_BASE_URL", "")
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", socket.gethostname())  # cluster/pod IP
 
     # W&B settings
@@ -172,10 +179,12 @@ def execute(args: ScriptArgs):
         "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
         "--tito-model glm47 "
         "--use-session-server "
-        "--session-server-port 30000 "
+        f"--session-server-port {args.session_server_port} "
         # This is required by terminus-2 harness
         "--tito-allowed-append-roles user tool "
     )
+    if args.session_server_bind_ip:
+        agent_args += f"--session-server-bind-ip {args.session_server_bind_ip} "
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -184,6 +193,7 @@ def execute(args: ScriptArgs):
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
         "--colocate "
+        "--pin-rollout-manager-to-head "
         f"--actor-num-nodes {args.num_nodes} "
         f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
         f"--rollout-num-gpus {args.num_gpus_per_node} "
@@ -231,10 +241,16 @@ def execute(args: ScriptArgs):
         "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
+        "AGENT_SERVER_AUTH_TOKEN": args.agent_server_auth_token,
+        "AGENT_SERVER_TIMEOUT_SEC": str(args.agent_server_timeout_sec),
         "MILES_ROUTER_EXTERNAL_HOST": args.router_external_host,
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
         "MILES_HOST_IP": args.miles_host_ip,
     }
+    if args.router_external_base_url:
+        extra_env_vars["MILES_ROUTER_EXTERNAL_BASE_URL"] = args.router_external_base_url
+    if session_api_key := os.environ.get("MILES_SESSION_API_KEY"):
+        extra_env_vars["MILES_SESSION_API_KEY"] = session_api_key
 
     U.execute_train(
         train_args=train_args,

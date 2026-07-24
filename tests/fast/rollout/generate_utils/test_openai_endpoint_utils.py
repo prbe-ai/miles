@@ -93,10 +93,10 @@ def _make_record(
 
 @pytest.mark.asyncio
 async def test_create_reads_session_server_instance_id_from_args(monkeypatch):
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, dict[str, str] | None]] = []
 
-    async def fake_post(url: str, payload: dict, action: str = "post"):
-        calls.append((action, url))
+    async def fake_post(url: str, payload: dict, action: str = "post", headers=None):
+        calls.append((action, url, headers))
         assert action == "post"
         assert url == "http://127.0.0.1:12345/sessions"
         return {"session_id": "session-123"}
@@ -107,6 +107,7 @@ async def test_create_reads_session_server_instance_id_from_args(monkeypatch):
         session_server_ip="127.0.0.1",
         session_server_ports=[12345],
         session_server_instance_ids={12345: "server-instance-123"},
+        session_server_api_key="test-session-key",
     )
     tracer = await OpenAIEndpointTracer.create(args)
 
@@ -114,12 +115,14 @@ async def test_create_reads_session_server_instance_id_from_args(monkeypatch):
     assert tracer.session_server_id == "127.0.0.1:12345"
     assert tracer.session_server_instance_id == "server-instance-123"
     # No /health probe: the id is read locally, create() issues only the POST.
-    assert calls == [("post", "http://127.0.0.1:12345/sessions")]
+    assert calls == [
+        ("post", "http://127.0.0.1:12345/sessions", {"Authorization": "Bearer test-session-key"})
+    ]
 
 
 @pytest.mark.asyncio
 async def test_create_without_instance_id_on_args(monkeypatch):
-    async def fake_post(url: str, payload: dict, action: str = "post"):
+    async def fake_post(url: str, payload: dict, action: str = "post", headers=None):
         return {"session_id": "session-123"}
 
     monkeypatch.setattr("miles.rollout.generate_utils.openai_endpoint_utils.post", fake_post)
@@ -135,10 +138,10 @@ async def test_create_distributes_sessions_across_port_range(monkeypatch):
     """With a multi-port range, sessions land on more than one instance, and every
     request of a session (create, chat, GET, DELETE) hits the port chosen
     at create time — the URL is the router."""
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, dict[str, str] | None]] = []
 
-    async def fake_post(url: str, payload: dict, action: str = "post"):
-        calls.append((action, url))
+    async def fake_post(url: str, payload: dict, action: str = "post", headers=None):
+        calls.append((action, url, headers))
         if action == "post" and url.endswith("/sessions"):
             return {"session_id": f"session-{len(calls)}"}
         return {"session_id": url.rsplit("/", 1)[1], "records": [], "metadata": {}}
@@ -146,7 +149,11 @@ async def test_create_distributes_sessions_across_port_range(monkeypatch):
     monkeypatch.setattr("miles.rollout.generate_utils.openai_endpoint_utils.post", fake_post)
 
     ports = [12345, 12346, 12347, 12348]
-    args = SimpleNamespace(session_server_ip="127.0.0.1", session_server_ports=ports)
+    args = SimpleNamespace(
+        session_server_ip="127.0.0.1",
+        session_server_ports=ports,
+        session_server_api_key="test-session-key",
+    )
 
     chosen_ports = set()
     for _ in range(32):
@@ -158,11 +165,12 @@ async def test_create_distributes_sessions_across_port_range(monkeypatch):
 
         await tracer.collect_records()
         prefix = f"http://127.0.0.1:{port}"
-        assert [url for _, url in calls] == [
+        assert [url for _, url, _ in calls] == [
             f"{prefix}/sessions",
             tracer.base_url,
             tracer.base_url,
         ]
+        assert all(headers == {"Authorization": "Bearer test-session-key"} for _, _, headers in calls)
         assert tracer.base_url.startswith(f"{prefix}/sessions/")
 
     # 32 uniform picks over 4 ports miss a given port with p = (3/4)^32 ≈ 1e-4.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -65,6 +66,31 @@ class TestStartSessionServer:
         with patch("miles.ray.rollout.router_manager.is_port_available", return_value=False):
             with pytest.raises(RuntimeError, match="already in use"):
                 start_session_server(args)
+
+    def test_separate_bind_ip_and_api_key_preserve_client_address(self, monkeypatch):
+        monkeypatch.setenv("MILES_SESSION_API_KEY", "test-session-key")
+        args = make_args(
+            use_session_server=True,
+            hf_checkpoint="/fake/model",
+            sglang_router_ip="10.0.0.1",
+            sglang_router_port=20000,
+            session_server_ip="10.0.0.1",
+            session_server_bind_ip="0.0.0.0",
+            session_server_port=[20001],
+        )
+        process = SimpleNamespace(daemon=False, start=lambda: None)
+
+        with patch("miles.ray.rollout.router_manager.is_port_available", return_value=True), patch(
+            "miles.ray.rollout.router_manager.multiprocessing.get_context"
+        ) as get_context, patch("miles.ray.rollout.router_manager.wait_for_server_ready") as wait_ready:
+            get_context.return_value.Process.return_value = process
+            start_session_server(args)
+
+        assert args.session_server_ip == "10.0.0.1"
+        assert args.session_server_bind_ip == "0.0.0.0"
+        assert args.session_server_api_key == "test-session-key"
+        assert args.session_server_ports == [20001]
+        wait_ready.assert_called_once_with("10.0.0.1", 20001, process, timeout=30)
 
 
 class TestResolveSessionServerPorts:

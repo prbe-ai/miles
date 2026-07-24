@@ -78,8 +78,15 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Agent settings
     agent_server_url: str = os.environ.get("AGENT_SERVER_URL", "http://ts-egress-aws-agent-server:8080")
     agent_model_name: str = os.environ.get("AGENT_MODEL_NAME", "model")
+    agent_server_auth_token: str = os.environ.get(
+        "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+    )
+    agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
+    session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
+    session_server_bind_ip: str = os.environ.get("MILES_SESSION_SERVER_BIND_IP", "")
     harbor_tasks_dir: str = os.environ.get("HARBOR_TASKS_DIR", "/root/harbor_tasks")
     router_external_host: str = os.environ.get("MILES_ROUTER_EXTERNAL_HOST", "")
+    router_external_base_url: str = os.environ.get("MILES_ROUTER_EXTERNAL_BASE_URL", "")
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", "")
 
     # Disaggregated fully-async settings
@@ -281,9 +288,11 @@ def execute(args: ScriptArgs):
         "--custom-rm-path generate.reward_func "
         "--tito-model glm47 "
         "--use-session-server "
-        "--session-server-port 30000 "
+        f"--session-server-port {args.session_server_port} "
         "--tito-allowed-append-roles user tool "
     )
+    if args.session_server_bind_ip:
+        agent_args += f"--session-server-bind-ip {args.session_server_bind_ip} "
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -298,6 +307,7 @@ def execute(args: ScriptArgs):
         f"--rollout-num-gpus {rollout_gpus} "
         "--grad-reduce-in-bf16 "
         "--use-fault-tolerance "
+        "--pin-rollout-manager-to-head "
         f"--rollout-health-check-first-wait {args.rollout_health_check_first_wait} "
     )
     if args.accumulate_allreduce_grads_in_fp32:
@@ -354,11 +364,17 @@ def execute(args: ScriptArgs):
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "true",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
+        "AGENT_SERVER_AUTH_TOKEN": args.agent_server_auth_token,
+        "AGENT_SERVER_TIMEOUT_SEC": str(args.agent_server_timeout_sec),
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
         **sglang_extra_env_vars,
     }
     if args.router_external_host:
         extra_env_vars["MILES_ROUTER_EXTERNAL_HOST"] = args.router_external_host
+    if args.router_external_base_url:
+        extra_env_vars["MILES_ROUTER_EXTERNAL_BASE_URL"] = args.router_external_base_url
+    if session_api_key := os.environ.get("MILES_SESSION_API_KEY"):
+        extra_env_vars["MILES_SESSION_API_KEY"] = session_api_key
     if args.miles_host_ip:
         extra_env_vars["MILES_HOST_IP"] = args.miles_host_ip
 

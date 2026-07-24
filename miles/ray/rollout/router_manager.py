@@ -1,6 +1,7 @@
 import copy
 import logging
 import multiprocessing
+import os
 import random
 import uuid
 
@@ -112,6 +113,10 @@ def start_session_server(args):
 
     if getattr(args, "session_server_ip", None) is None:
         args.session_server_ip = args.sglang_router_ip
+    if getattr(args, "session_server_bind_ip", None) is None:
+        args.session_server_bind_ip = args.session_server_ip
+    if getattr(args, "session_server_api_key", None) is None:
+        args.session_server_api_key = os.getenv("MILES_SESSION_API_KEY", "")
 
     ip = args.session_server_ip
     ports = _resolve_session_server_ports(getattr(args, "session_server_port", None))
@@ -147,4 +152,10 @@ def start_session_server(args):
     args.session_server_instance_ids = instance_ids
     for port, process in processes:
         wait_for_server_ready(ip, port, process, timeout=30)
-    logger.info(f"Session servers launched at {ip}, ports {ports} ({len(ports)} instances)")
+    logger.info(
+        "Session servers launched at %s, ports %s (%s instances, bind=%s)",
+        ip,
+        ports,
+        len(ports),
+        args.session_server_bind_ip,
+    )

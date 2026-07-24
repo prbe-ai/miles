@@ -22,11 +22,18 @@ _SESSION_REQUEST_TIMEOUT = 120
 
 
 class OpenAIEndpointTracer:
-    def __init__(self, router_url: str, session_id: str, session_server_instance_id: str | None = None):
+    def __init__(
+        self,
+        router_url: str,
+        session_id: str,
+        session_server_instance_id: str | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         self.router_url = router_url
         self.session_id = session_id
         self.base_url = f"{router_url}/sessions/{session_id}"
         self.session_server_instance_id = session_server_instance_id
+        self.headers = headers
 
     @property
     def session_server_id(self) -> str:
@@ -48,18 +55,21 @@ class OpenAIEndpointTracer:
         session_url = f"http://{session_ip}:{session_port}"
         instance_ids = getattr(args, "session_server_instance_ids", None) or {}
         session_server_instance_id = instance_ids.get(session_port)
-        response = await post(f"{session_url}/sessions", {}, action="post")
+        api_key = getattr(args, "session_server_api_key", None)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        response = await post(f"{session_url}/sessions", {}, action="post", headers=headers)
         session_id = response["session_id"]
         return OpenAIEndpointTracer(
             router_url=session_url,
             session_id=session_id,
             session_server_instance_id=session_server_instance_id,
+            headers=headers,
         )
 
     async def collect_records(self) -> tuple[list[SessionRecord], dict]:
         try:
             response = await asyncio.wait_for(
-                post(self.base_url, {}, action="get"),
+                post(self.base_url, {}, action="get", headers=self.headers),
                 timeout=_SESSION_REQUEST_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -70,7 +80,7 @@ class OpenAIEndpointTracer:
             # Still attempt to clean up the session.
             try:
                 await asyncio.wait_for(
-                    post(self.base_url, {}, action="delete"),
+                    post(self.base_url, {}, action="delete", headers=self.headers),
                     timeout=_SESSION_REQUEST_TIMEOUT,
                 )
             except Exception:
@@ -85,7 +95,7 @@ class OpenAIEndpointTracer:
 
         try:
             await asyncio.wait_for(
-                post(self.base_url, {}, action="delete"),
+                post(self.base_url, {}, action="delete", headers=self.headers),
                 timeout=_SESSION_REQUEST_TIMEOUT,
             )
         except Exception as e:
