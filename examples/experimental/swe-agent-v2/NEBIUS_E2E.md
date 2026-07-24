@@ -925,6 +925,13 @@ export HARBOR_DATA_ROOT=/workspace/harbor
 export HARBOR_TASKS_DIR="$HARBOR_DATA_ROOT/tasks/terminal-bench-2"
 export HARBOR_TRIALS_DIR="$HARBOR_DATA_ROOT/trials"
 export MILES_HARBOR_CAPTURE_DIR="$HARBOR_DATA_ROOT/captures"
+# Capture is off by default since the additive capture modes shipped; without
+# this the bridge stages nothing and the watcher below has nothing to export.
+export MILES_HARBOR_CAPTURE_MODE=shadow
+# Ephemeral begin/end sandbox filesystem snapshots (probe.sandbox-state/1).
+# Requires probe-research >= 0.9.1 (packaged probe-sandbox-snapshot binaries;
+# PyPI's 0.9.0 shipped without them — install from git, see the capture reqs).
+export MILES_SANDBOX_STATE=1
 export HARBOR_ENVIRONMENT_TYPE=daytona
 export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{}'
 export HARBOR_DELETE_ENVIRONMENTS=true
@@ -956,6 +963,30 @@ Do not point the watcher at `HARBOR_TRIALS_DIR`. The capture directory is the
 atomic handoff boundary and survives Harbor sandbox teardown, bridge restarts,
 and Research OS outages. `probe trial drain "$MILES_HARBOR_CAPTURE_DIR"`
 performs a one-shot repair after an outage.
+
+With `MILES_SANDBOX_STATE=1` each staged trial additionally carries
+`trial/artifacts/probe-sandbox-state/` — begin/end filesystem manifests and
+the agent's delta tarball, captured inside the sandbox at `AGENT_START` /
+`AGENT_END` via an uploaded static binary and removed from the container in
+the same instant (the sandbox is probe-free during the whole agent phase).
+Verify after the first trial:
+
+```bash
+capture=$(ls -dt "$MILES_HARBOR_CAPTURE_DIR"/*/ | head -1)
+python3 - "$capture" <<'EOF'
+import json, pathlib, sys
+meta = pathlib.Path(sys.argv[1]) / "trial/artifacts/probe-sandbox-state/meta.json"
+doc = json.loads(meta.read_text())
+assert doc["schema"] == "probe.sandbox-state/1", doc
+print(json.dumps({"status": doc["status"], "summary": doc["summary"],
+                  "integrity": doc["integrity"], "errors": doc["errors"][:3]}, indent=2))
+EOF
+```
+
+A missing `meta.json` means the capture failed midway (`/run`'s
+`capture.sandbox_state` and the bridge log carry the reason); a healthy run
+shows both phases `ok`, `integrity` all-true, and plausible added/modified
+counts. Snapshot failures never fail the trial itself.
 
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, and Daytona cleanup. This still does not prove
