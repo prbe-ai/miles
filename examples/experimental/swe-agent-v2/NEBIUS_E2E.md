@@ -994,6 +994,16 @@ Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, and Daytona cleanup. This still does not prove
 the model callback.
 
+`provider_sandbox_id` is best-effort in the post-trial bridge response. Harbor
+0.18 clears the Daytona environment's private `_sandbox` reference during
+teardown, before the bridge performs its final correlation lookup, so a
+successful response may omit that field even though the sandbox was created
+and deleted correctly. This is a lifecycle-timing limitation, not a deprecated
+response field. If a gate requires the exact Daytona ID, capture it from the
+live environment during an `AGENT_START` hook; a lookup after `Trial.run()`
+cannot recover it. Otherwise prove cleanup with a before/after Daytona
+inventory in addition to the normal trial, capture, and integrity checks.
+
 **Sandbox-capture self-check (couple this to the oracle smoke).** Once the
 oracle trial has staged, validate its bundle with the shipped checker
 (stdlib-only, no probe install needed):
@@ -1030,8 +1040,7 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    app: miles
-    role: head
+    miles.prbe.ai/ray-role: head
   ports:
     - name: session
       protocol: TCP
