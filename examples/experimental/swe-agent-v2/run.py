@@ -228,6 +228,7 @@ def execute(args: ScriptArgs):
 
     extra_env_vars = {
         "PYTHONPATH": f"{args.megatron_path}:{SCRIPT_DIR}:{miles_root}",
+        "TRITON_CACHE_DIR": f"/tmp/miles-triton-cache/{args.run_id}",
         "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
