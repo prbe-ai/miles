@@ -1,0 +1,13 @@
+-r requirements-public-harbor-server.txt
+# Native Harbor capture needs the Probe SDK producer adapter, and sandbox-state
+# snapshots (MILES_SANDBOX_STATE=1) additionally need the packaged
+# probe-sandbox-snapshot binaries. Both ship in probe-research 0.9.1 (main
+# published a binary-less 0.9.0 to PyPI, so 0.9.1 is the first release carrying
+# the snapshot binaries).
+#
+# Install from git: the binaries are committed to the repo, so NO Go toolchain
+# is needed at install time. probe-research 0.9.1 sorts above every PyPI release,
+# so a resolver will not silently downgrade this git install to a binary-less
+# wheel.
+probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main
+# After 0.9.1 is on PyPI the line above may be replaced with: probe-research>=0.9.1

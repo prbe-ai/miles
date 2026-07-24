@@ -251,7 +251,13 @@ Then open `http://<host>:8081` in a browser.
 | `AGENT_MAX_CONCURRENT` | `8` | Max concurrent Harbor trials |
 | `HARBOR_TASKS_DIR` | `/root/harbor_tasks` | Root directory containing task subdirectories |
 | `HARBOR_TRIALS_DIR` | `./trials` | Harbor's native host-side trial output directory |
+| `MILES_HARBOR_CAPTURE_MODE` | `off` | `off`, fail-open local `shadow`, or fail-closed `required` capture |
 | `MILES_HARBOR_CAPTURE_DIR` | sibling `<trials>-captures` | Durable staging directory; set this to a shared PVC in production |
+| `MILES_SANDBOX_STATE` | `false` | Ephemeral begin/end sandbox filesystem snapshots (`probe.sandbox-state/1`); requires a non-`off` capture mode |
+| `MILES_SANDBOX_STATE_TIMEOUT_BEGIN` | `120` | Seconds allowed for the begin snapshot (upload+scan+download+cleanup) |
+| `MILES_SANDBOX_STATE_TIMEOUT_END` | `300` | Seconds allowed for the end snapshot and delta tar |
+| `MILES_SANDBOX_STATE_EXCLUDE` | unset | Colon-separated extra container path prefixes to exclude from scans |
+| `MILES_SANDBOX_STATE_HASH` | `false` | sha256 every file in the manifests (slow; catches mtime-preserving edits) |
 | `HARBOR_DELETE_ENVIRONMENTS` | `true` | Whether Harbor deletes the sandbox during `Trial.run()` cleanup |
 | `HARBOR_ADMIN_SECRET` | unset | Optional bearer secret for `/flush`; falls back to the bridge auth token |
 | `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Hostname for agent containers to reach Miles Router |
@@ -276,11 +282,28 @@ These are passed as CLI args to `run.sh` (not defaults, since they vary per mode
    - Agent calls back to Miles Router at `OPENAI_API_BASE` for model inference
    - Runs the verifier (`test.sh`) and returns `TrialResult` with reward
 4. **TITO recording**: Miles Router proxies each `/v1/chat/completions` to SGLang and records exact token IDs and logprobs
-5. **Native capture**: after `Trial.run()` returns, the bridge calls the Probe SDK's producer adapter, which atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes its versioned manifest plus a pending export request
+5. **Native capture (opt-in)**: in `shadow` or `required` mode, after `Trial.run()` returns, the bridge calls the Probe SDK's producer adapter, which atomically copies and archives Harbor's complete host trial tree, hashes every regular file, and writes its versioned manifest plus a pending export request
 6. **Sample building**: Records are converted to training `Sample`s with token IDs, logprobs, loss masks
 7. **Training**: GRPO policy update using Megatron, then weights synced back to SGLang engines
 
 ### Native Harbor capture boundary
+
+Capture is off by default, with no Probe import, capture-directory creation, or
+capture/correlation fields added to the `/run` response. Install the optional
+capture dependencies and select a mode:
+
+```bash
+pip install -r requirements-public-harbor-capture.txt
+export MILES_HARBOR_CAPTURE_MODE=shadow
+export MILES_HARBOR_CAPTURE_DIR=/durable/trial-captures
+```
+
+`shadow` stages locally but never changes a successful Harbor rollout into a
+failure when staging fails; the response reports `capture.status=failed`.
+`required` performs the same local staging but changes `exit_status` to
+`Error: CaptureRequiredError` when the capture is failed or incomplete. Neither
+mode uploads on the request path. The separate watcher performs network
+publication.
 
 Set `MILES_HARBOR_CAPTURE_DIR` to a shared PVC. Each completed capture contains
 `trial/` (directly consumable by `probe.connectors.harbor.capture_trial`),
@@ -311,6 +334,31 @@ control back. Harbor downloads its configured agent logs and artifacts before
 that cleanup, but arbitrary sandbox state outside those configured Harbor
 outputs is unknowable after deletion. The bridge does not claim that staging
 precedes sandbox teardown.
+
+### Sandbox begin/end state snapshots (opt-in)
+
+`MILES_SANDBOX_STATE=1` narrows the boundary above: the bridge registers
+Harbor `Trial` lifecycle hooks (`AGENT_START` / `AGENT_END`) and, at each
+instant, uploads a static, dependency-free snapshot binary into a random
+`/tmp` workdir inside the still-running container, execs it as root,
+downloads the outputs to the host, verifies them against the sha256 trailer
+the binary prints to stdout, and deletes the workdir — so the container is
+probe-free for the entire agent phase, and nothing of the capture survives
+in the sandbox. The resulting `probe.sandbox-state/1` bundle (begin/end
+JSONL manifests + a delta tar of files the agent added or modified +
+host-authored `meta.json`) is written into `<trial_dir>/artifacts/` before
+staging, so it rides the existing capture and exporter unchanged, and the
+`/run` response reports it under `capture.sandbox_state`.
+
+Snapshots are fail-open at every layer: a python-less/shell-less image, an
+unsupported arch, a timeout, or a dead environment degrade to a partial or
+absent bundle with the reason recorded — never a failed trial. The agent
+phase itself is never concurrent with a scan; the cost is bounded seconds of
+trial wall-clock at the two hook instants. `AGENT_END` fires before
+verification in both verifier modes, so the end state is exactly "the state
+the agent left," excluding `test.sh` side effects. The begin/end state of
+files Harbor never materialized in-container (in-memory state, deleted-
+before-end temporaries) remains out of scope.
 
 ### Multi-turn merge (TITO mode)
 
