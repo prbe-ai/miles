@@ -969,28 +969,30 @@ With `MILES_SANDBOX_STATE=1` each staged trial additionally carries
 the agent's delta tarball, captured inside the sandbox at `AGENT_START` /
 `AGENT_END` via an uploaded static binary and removed from the container in
 the same instant (the sandbox is probe-free during the whole agent phase).
-Verify after the first trial:
-
-```bash
-capture=$(ls -dt "$MILES_HARBOR_CAPTURE_DIR"/*/ | head -1)
-python3 - "$capture" <<'EOF'
-import json, pathlib, sys
-meta = pathlib.Path(sys.argv[1]) / "trial/artifacts/probe-sandbox-state/meta.json"
-doc = json.loads(meta.read_text())
-assert doc["schema"] == "probe.sandbox-state/1", doc
-print(json.dumps({"status": doc["status"], "summary": doc["summary"],
-                  "integrity": doc["integrity"], "errors": doc["errors"][:3]}, indent=2))
-EOF
-```
-
-A missing `meta.json` means the capture failed midway (`/run`'s
-`capture.sandbox_state` and the bridge log carry the reason); a healthy run
-shows both phases `ok`, `integrity` all-true, and plausible added/modified
-counts. Snapshot failures never fail the trial itself.
 
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, and Daytona cleanup. This still does not prove
 the model callback.
+
+**Sandbox-capture self-check (couple this to the oracle smoke).** Once the
+oracle trial has staged, validate its bundle with the shipped checker
+(stdlib-only, no probe install needed):
+
+```bash
+python3 examples/experimental/swe-agent-v2/check_sandbox_bundle.py \
+  "$MILES_HARBOR_CAPTURE_DIR" --latest --require-integrity
+```
+
+Exit 0 means the latest trial's bundle is present, both phases are `ok`,
+sha256 integrity holds, and the manifests are non-empty; it prints the
+`+added/~modified/-deleted` summary and file count so you can sanity-check
+the capture scope against the task image. Exit 1 flags an incomplete or
+integrity-failed bundle (a missing `meta.json` = capture died midway; the
+reason is in `/run`'s `capture.sandbox_state` and the bridge log). Exit 2
+means no bundle was found — check that `MILES_SANDBOX_STATE=1` and a
+non-`off` capture mode were both set. Snapshot failures never fail the
+trial itself, so this check is how you confirm the sandbox half is live
+before committing to the full run.
 
 ## 16. Expose the first model callback
 
