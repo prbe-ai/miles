@@ -837,6 +837,20 @@ kubectl exec -n miles miles-worker -- \
   pip install -e /workspace/miles --no-deps
 ```
 
+Probe metric tracking (`MILES_USE_PROBE=1`, section 18/23) needs the Probe
+SDK in **each training environment** — `ProbeBackend` imports
+`probe.integrations.miles`, so without this the training run raises at
+tracking init. Install the git pin (probe-research 0.9.1, binaries committed,
+no Go toolchain) on both Pods:
+
+```bash
+kubectl exec -n miles miles-head -- \
+  pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
+
+kubectl exec -n miles miles-worker -- \
+  pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
+```
+
 Install the isolated Harbor/Daytona venv on the head only:
 
 ```bash
@@ -845,8 +859,13 @@ kubectl exec -it -n miles miles-head -- bash
 cd /workspace/miles
 export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
 uv venv "$HARBOR_VENV" --python 3.12
+# requirements-public-harbor-capture.txt pulls probe-research (0.9.1, with the
+# packaged sandbox-snapshot binaries) from git. WITHOUT it the bridge raises at
+# startup under MILES_HARBOR_CAPTURE_MODE!=off or MILES_SANDBOX_STATE=1, and the
+# `probe` CLI (watcher, below) is absent.
 uv pip install --python "$HARBOR_VENV/bin/python" \
   -r examples/experimental/swe-agent-v2/requirements-runpod.txt \
+  -r examples/experimental/swe-agent-v2/requirements-public-harbor-capture.txt \
   pytest pytest-asyncio ruff
 
 python examples/experimental/swe-agent-v2/runpod_preflight.py --phase repo
@@ -925,6 +944,13 @@ export HARBOR_DATA_ROOT=/workspace/harbor
 export HARBOR_TASKS_DIR="$HARBOR_DATA_ROOT/tasks/terminal-bench-2"
 export HARBOR_TRIALS_DIR="$HARBOR_DATA_ROOT/trials"
 export MILES_HARBOR_CAPTURE_DIR="$HARBOR_DATA_ROOT/captures"
+# Capture is off by default since the additive capture modes shipped; without
+# this the bridge stages nothing and the watcher below has nothing to export.
+export MILES_HARBOR_CAPTURE_MODE=shadow
+# Ephemeral begin/end sandbox filesystem snapshots (probe.sandbox-state/1).
+# Requires probe-research >= 0.9.1 (packaged probe-sandbox-snapshot binaries;
+# PyPI's 0.9.0 shipped without them — install from git, see the capture reqs).
+export MILES_SANDBOX_STATE=1
 export HARBOR_ENVIRONMENT_TYPE=daytona
 export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{}'
 export HARBOR_DELETE_ENVIRONMENTS=true
@@ -948,7 +974,8 @@ this process validates and uploads them without adding network latency to
 
 ```bash
 export PROBE_TOKEN='<write token from the Kubernetes secret>'
-nohup probe trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
+# Use the Harbor venv's probe CLI (that is where probe-research was installed).
+nohup "$HARBOR_VENV/bin/probe" trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
   >/workspace/logs/probe-harbor-export.log 2>&1 &
 ```
 
@@ -957,9 +984,35 @@ atomic handoff boundary and survives Harbor sandbox teardown, bridge restarts,
 and Research OS outages. `probe trial drain "$MILES_HARBOR_CAPTURE_DIR"`
 performs a one-shot repair after an outage.
 
+With `MILES_SANDBOX_STATE=1` each staged trial additionally carries
+`trial/artifacts/probe-sandbox-state/` — begin/end filesystem manifests and
+the agent's delta tarball, captured inside the sandbox at `AGENT_START` /
+`AGENT_END` via an uploaded static binary and removed from the container in
+the same instant (the sandbox is probe-free during the whole agent phase).
+
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, and Daytona cleanup. This still does not prove
 the model callback.
+
+**Sandbox-capture self-check (couple this to the oracle smoke).** Once the
+oracle trial has staged, validate its bundle with the shipped checker
+(stdlib-only, no probe install needed):
+
+```bash
+python3 examples/experimental/swe-agent-v2/check_sandbox_bundle.py \
+  "$MILES_HARBOR_CAPTURE_DIR" --latest --require-integrity
+```
+
+Exit 0 means the latest trial's bundle is present, both phases are `ok`,
+sha256 integrity holds, and the manifests are non-empty; it prints the
+`+added/~modified/-deleted` summary and file count so you can sanity-check
+the capture scope against the task image. Exit 1 flags an incomplete or
+integrity-failed bundle (a missing `meta.json` = capture died midway; the
+reason is in `/run`'s `capture.sandbox_state` and the bridge log). Exit 2
+means no bundle was found — check that `MILES_SANDBOX_STATE=1` and a
+non-`off` capture mode were both set. Snapshot failures never fail the
+trial itself, so this check is how you confirm the sandbox half is live
+before committing to the full run.
 
 ## 16. Expose the first model callback
 
@@ -1088,7 +1141,28 @@ The gate succeeds only when:
 ## 18. Launch and monitor training
 
 Only launch normal training after rerunning both smoke gates through the TLS
-callback. Use section 15 of `RUNPOD_E2E.md`, with:
+callback.
+
+**Enable Probe metric tracking BEFORE launching** (these are read at
+argument-parse time via `env_flag`, so they must be in the training
+environment — the Ray driver *and* both node workers — before the launch, not
+set afterward in section 23). `MILES_USE_PROBE=1` flips on `--use-probe`; the
+`PROBE_*` vars name the run and its durable queue:
+
+```bash
+export MILES_USE_PROBE=1
+export PROBE_PROJECT=miles-nebius
+export PROBE_EXPERIMENT=swe-agent-v2-nebius
+export PROBE_EXTERNAL_ID='<stable Nebius/Ray job ID>'
+export PROBE_QUEUE_DIR=/workspace/probe/metrics
+```
+
+If the launcher submits a Ray job with an isolated `runtime_env`, pass these
+through it so the workers inherit them; a bare shell export on the head alone
+will not reach the actors. Section 23 covers the queue/exporter mechanics and
+recovery.
+
+Then use section 15 of `RUNPOD_E2E.md`, with:
 
 ```text
 --num-nodes 2
