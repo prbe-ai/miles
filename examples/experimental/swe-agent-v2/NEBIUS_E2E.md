@@ -837,6 +837,20 @@ kubectl exec -n miles miles-worker -- \
   pip install -e /workspace/miles --no-deps
 ```
 
+Probe metric tracking (`MILES_USE_PROBE=1`, section 18/23) needs the Probe
+SDK in **each training environment** — `ProbeBackend` imports
+`probe.integrations.miles`, so without this the training run raises at
+tracking init. Install the git pin (probe-research 0.9.1, binaries committed,
+no Go toolchain) on both Pods:
+
+```bash
+kubectl exec -n miles miles-head -- \
+  pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
+
+kubectl exec -n miles miles-worker -- \
+  pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
+```
+
 Install the isolated Harbor/Daytona venv on the head only:
 
 ```bash
@@ -845,8 +859,13 @@ kubectl exec -it -n miles miles-head -- bash
 cd /workspace/miles
 export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
 uv venv "$HARBOR_VENV" --python 3.12
+# requirements-public-harbor-capture.txt pulls probe-research (0.9.1, with the
+# packaged sandbox-snapshot binaries) from git. WITHOUT it the bridge raises at
+# startup under MILES_HARBOR_CAPTURE_MODE!=off or MILES_SANDBOX_STATE=1, and the
+# `probe` CLI (watcher, below) is absent.
 uv pip install --python "$HARBOR_VENV/bin/python" \
   -r examples/experimental/swe-agent-v2/requirements-runpod.txt \
+  -r examples/experimental/swe-agent-v2/requirements-public-harbor-capture.txt \
   pytest pytest-asyncio ruff
 
 python examples/experimental/swe-agent-v2/runpod_preflight.py --phase repo
@@ -955,7 +974,8 @@ this process validates and uploads them without adding network latency to
 
 ```bash
 export PROBE_TOKEN='<write token from the Kubernetes secret>'
-nohup probe trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
+# Use the Harbor venv's probe CLI (that is where probe-research was installed).
+nohup "$HARBOR_VENV/bin/probe" trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
   >/workspace/logs/probe-harbor-export.log 2>&1 &
 ```
 
@@ -1121,7 +1141,28 @@ The gate succeeds only when:
 ## 18. Launch and monitor training
 
 Only launch normal training after rerunning both smoke gates through the TLS
-callback. Use section 15 of `RUNPOD_E2E.md`, with:
+callback.
+
+**Enable Probe metric tracking BEFORE launching** (these are read at
+argument-parse time via `env_flag`, so they must be in the training
+environment — the Ray driver *and* both node workers — before the launch, not
+set afterward in section 23). `MILES_USE_PROBE=1` flips on `--use-probe`; the
+`PROBE_*` vars name the run and its durable queue:
+
+```bash
+export MILES_USE_PROBE=1
+export PROBE_PROJECT=miles-nebius
+export PROBE_EXPERIMENT=swe-agent-v2-nebius
+export PROBE_EXTERNAL_ID='<stable Nebius/Ray job ID>'
+export PROBE_QUEUE_DIR=/workspace/probe/metrics
+```
+
+If the launcher submits a Ray job with an isolated `runtime_env`, pass these
+through it so the workers inherit them; a bare shell export on the head alone
+will not reach the actors. Section 23 covers the queue/exporter mechanics and
+recovery.
+
+Then use section 15 of `RUNPOD_E2E.md`, with:
 
 ```text
 --num-nodes 2
