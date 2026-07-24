@@ -929,7 +929,8 @@ export MILES_HARBOR_CAPTURE_DIR="$HARBOR_DATA_ROOT/captures"
 # this the bridge stages nothing and the watcher below has nothing to export.
 export MILES_HARBOR_CAPTURE_MODE=shadow
 # Ephemeral begin/end sandbox filesystem snapshots (probe.sandbox-state/1).
-# Requires probe-research >= 0.9 (packaged probe-sandbox-snapshot binaries).
+# Requires probe-research >= 0.9.1 (packaged probe-sandbox-snapshot binaries;
+# PyPI's 0.9.0 shipped without them — install from git, see the capture reqs).
 export MILES_SANDBOX_STATE=1
 export HARBOR_ENVIRONMENT_TYPE=daytona
 export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{}'
