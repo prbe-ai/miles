@@ -1042,9 +1042,9 @@ spec:
   selector:
     miles.prbe.ai/ray-role: head
   ports:
-    - name: session
+    - name: http-session
       protocol: TCP
-      port: 30000
+      port: 80
       targetPort: 30000
 YAML
 
@@ -1066,13 +1066,22 @@ Use this only for the initial smoke:
 ```bash
 export MILES_SESSION_SERVER_PORT=30000
 export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
-export MILES_ROUTER_EXTERNAL_HOST="$MILES_PUBLIC_IP"
+export MILES_ROUTER_EXTERNAL_BASE_URL="http://$MILES_PUBLIC_IP"
+unset MILES_ROUTER_EXTERNAL_HOST
 export MILES_HARBOR_ALLOWED_CALLBACK_HOSTS="$MILES_PUBLIC_IP,localhost,127.0.0.1"
 ```
 
 The Miles session server enforces `MILES_SESSION_API_KEY`, but direct traffic
 is still plain HTTP. Restart the bridge after changing its callback allowlist.
 Do not use this path for sensitive or long-running training.
+
+The Daytona organization must be Tier 3 or higher for either callback path.
+Tier 1 and Tier 2 restrict arbitrary outbound network access at the
+organization level, and a per-sandbox IP/domain allowlist cannot override
+that policy. A repeating
+`OpenAIException - Internet is restricted on Tier 1 and Tier 2` error means
+the organization must be upgraded before this gate can pass. See
+[Daytona network limits](https://www.daytona.io/docs/en/network-limits/).
 
 ### Production TLS callback
 
@@ -1102,7 +1111,13 @@ Open a shell in the head Pod and export the same model/task variables used by
 the Runpod guide:
 
 ```bash
-kubectl exec -it -n miles miles-head -- bash
+export HEAD_POD="$(
+  kubectl get pods -n miles \
+    -l miles.prbe.ai/ray-role=head \
+    -o jsonpath='{.items[0].metadata.name}'
+)"
+test -n "$HEAD_POD"
+kubectl exec -it -n miles "$HEAD_POD" -- bash
 
 cd /workspace/miles
 export RAY_ADDRESS=http://127.0.0.1:8265
@@ -1117,8 +1132,8 @@ export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 For direct smoke:
 
 ```bash
-export MILES_ROUTER_EXTERNAL_HOST='<LoadBalancer external IP>'
-unset MILES_ROUTER_EXTERNAL_BASE_URL
+export MILES_ROUTER_EXTERNAL_BASE_URL='http://<LoadBalancer external IP>'
+unset MILES_ROUTER_EXTERNAL_HOST
 ```
 
 For relay/TLS:
@@ -1140,7 +1155,8 @@ Run section 13 of `RUNPOD_E2E.md` for exactly one colocated
 Then run section 14's fully async two-node debug command with the same changes.
 The gate succeeds only when:
 
-- RolloutManager/session server is in `miles-head`;
+- RolloutManager/session server is in the head Pod selected by
+  `miles.prbe.ai/ray-role=head`;
 - Ray reports 16 GPUs across two nodes;
 - Daytona calls the advertised `/sessions/<id>/v1/chat/completions` URL;
 - Miles records and collects at least one model turn;
@@ -1260,6 +1276,7 @@ failed validation; changing it to 2 exposed the subsequent gradient-buffer OOM.
 | Both Miles Pods land on one node | Verify eight-GPU requests and required pod anti-affinity. |
 | Ray sees fewer than 16 GPUs | Fix Pod GPU visibility or Ray membership before launch. |
 | Daytona cannot reach the callback | Check public Service/relay, allowlist, bearer, DNS, and session bind address. |
+| Daytona reports Internet is restricted on Tier 1 or Tier 2 | Upgrade the Daytona organization to Tier 3 or higher; sandbox-level allowlists cannot override the organization policy. |
 | Callback returns 401 | Confirm the same `MILES_SESSION_API_KEY` reaches Miles, Harbor monitor, and Daytona agent. |
 | Callback returns a session 404/identity mismatch | Stop: traffic reached the wrong or restarted session server. |
 | Shared filesystem is slow | Benchmark it and revisit filesystem size/type; do not assume capacity alone implies required bandwidth. |
