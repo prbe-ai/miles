@@ -14,14 +14,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import shlex
+import shutil
+import tempfile
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -49,6 +55,10 @@ _SEQUENCE_EXCEPTIONS = {
 _HOST_AGENTS = {"terminus", "terminus-1", "terminus-2"}
 _EXPECTED_TRIAL_FILES = ("config.json", "lock.json", "result.json")
 _CAPTURE_MODES = frozenset({"off", "shadow", "required"})
+_SANDBOX_STATE_OUTPUTS = {
+    "begin": ("begin-manifest.jsonl.gz",),
+    "end": ("end-manifest.jsonl.gz", "end-delta.tar.gz"),
+}
 
 
 class RunRequest(BaseModel):
@@ -94,6 +104,7 @@ class CaptureResult(BaseModel):
     size_bytes: int = 0
     completeness_scope: str = "host_harbor_trial_tree"
     sandbox_state_outside_harbor_outputs: str = "unknown"
+    sandbox_state: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -125,6 +136,11 @@ class Settings:
     trials_dir: Path = Path("./trials")
     capture_dir: Path = Path("./trial-captures")
     capture_mode: str = "off"
+    sandbox_state: bool = False
+    sandbox_state_begin_timeout_sec: float = 120.0
+    sandbox_state_end_timeout_sec: float = 300.0
+    sandbox_state_exclude: str = ""
+    sandbox_state_hash: bool = False
     environment_type: str = "docker"
     environment_kwargs: dict[str, Any] = field(default_factory=dict)
     delete_environments: bool = True
@@ -140,6 +156,8 @@ class Settings:
         if self.capture_mode not in _CAPTURE_MODES:
             choices = ", ".join(sorted(_CAPTURE_MODES))
             raise ValueError(f"MILES_HARBOR_CAPTURE_MODE must be one of: {choices}")
+        if self.sandbox_state and self.capture_mode == "off":
+            raise ValueError("MILES_SANDBOX_STATE=1 requires MILES_HARBOR_CAPTURE_MODE=shadow or required; the sandbox-state bundle ships inside the staged capture")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -159,6 +177,11 @@ class Settings:
             trials_dir=trials_dir,
             capture_dir=Path(os.getenv("MILES_HARBOR_CAPTURE_DIR", str(default_capture_dir))),
             capture_mode=os.getenv("MILES_HARBOR_CAPTURE_MODE", "off").strip().lower(),
+            sandbox_state=_env_bool("MILES_SANDBOX_STATE", False),
+            sandbox_state_begin_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "120")),
+            sandbox_state_end_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_END", "300")),
+            sandbox_state_exclude=os.getenv("MILES_SANDBOX_STATE_EXCLUDE", ""),
+            sandbox_state_hash=_env_bool("MILES_SANDBOX_STATE_HASH", False),
             environment_type=os.getenv("HARBOR_ENVIRONMENT_TYPE", "docker"),
             environment_kwargs=environment_kwargs,
             delete_environments=_env_bool("HARBOR_DELETE_ENVIRONMENTS", True),
@@ -202,9 +225,7 @@ def validate_callback_url(base_url: str, settings: Settings) -> None:
     if settings.allow_any_callback:
         return
     if parsed.hostname.lower() not in settings.allowed_callback_hosts:
-        raise ValueError(
-            f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS"
-        )
+        raise ValueError(f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS")
 
 
 def validate_session_server_id(session_server_id: str, settings: Settings) -> None:
@@ -295,12 +316,174 @@ def stage_trial_capture(
         archive_content_hash=archive.get("content_hash"),
         external_key=descriptor_correlation.get("external_key"),
         file_count=len(files),
-        size_bytes=sum(
-            item.get("size_bytes", 0)
-            for item in files
-            if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)
-        ),
+        size_bytes=sum(item.get("size_bytes", 0) for item in files if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)),
     )
+
+
+class SandboxStateCapture:
+    """Ephemeral begin/end sandbox filesystem snapshots (``probe.sandbox-state/1``).
+
+    Registered on Harbor's Trial lifecycle hooks. Every callback is fail-open:
+    Harbor's ``_emit`` propagates hook exceptions and ``AGENT_END`` fires inside
+    the agent phase's ``finally``, so an unhandled raise here would mask the
+    trial's own outcome. ``asyncio.CancelledError`` is deliberately NOT caught —
+    a cancelled trial must keep unwinding, and losing the end snapshot there is
+    correct.
+
+    Ephemerality: each phase uploads the static snapshot binary into a random
+    ``/tmp`` workdir, execs it, downloads the outputs to the host, verifies them
+    against the sha256 trailer the binary prints to stdout, and deletes the
+    workdir — all inside the awaited hook, so the container is probe-free for
+    the entire agent phase. The bundle itself is authored host-side into the
+    trial tree, outside agent reach, and rides the existing staged capture.
+    """
+
+    def __init__(self, trial: Any, settings: Settings, host_dir: Path) -> None:
+        self._trial = trial
+        self._settings = settings
+        self._host_dir = host_dir
+        self._arch: str | None = None
+        self._trailers: dict[str, dict[str, Any]] = {}
+        self._timestamps: dict[str, str] = {}
+        self._integrity: dict[str, bool] = {}
+        self._errors: list[str] = []
+        self.status: dict[str, str | None] = {"begin": None, "end": None}
+
+    def install(self) -> None:
+        from harbor.trial.hooks import TrialEvent
+
+        self._trial.add_hook(TrialEvent.AGENT_START, self._hook("begin"))
+        self._trial.add_hook(TrialEvent.AGENT_END, self._hook("end"))
+
+    def _hook(self, phase: str) -> Callable[[Any], Awaitable[None]]:
+        async def callback(_event: Any) -> None:
+            timeout = self._settings.sandbox_state_begin_timeout_sec if phase == "begin" else self._settings.sandbox_state_end_timeout_sec
+            try:
+                await asyncio.wait_for(self._run_phase(phase), timeout=timeout)
+                self.status[phase] = "ok"
+            except Exception as exc:  # noqa: BLE001 - fail-open into Harbor's _emit
+                logger.exception("sandbox-state %s snapshot failed", phase)
+                self.status[phase] = f"{type(exc).__name__}: {exc}"
+
+        return callback
+
+    async def _run_phase(self, phase: str) -> None:
+        from probe.connectors import sandbox_state
+
+        if phase == "end" and self.status.get("begin") != "ok":
+            raise RuntimeError("begin snapshot unavailable; end delta skipped")
+        env = self._trial.agent_environment
+        phase_timeout = self._settings.sandbox_state_begin_timeout_sec if phase == "begin" else self._settings.sandbox_state_end_timeout_sec
+        # exec timeout bounds the HOST wait; the binary's own --max-seconds
+        # (set below it) bounds the in-CONTAINER process so a runaway scan
+        # exits itself rather than lingering past the agent phase. Both are
+        # needed: Harbor's exec on timeout only tears down the host-side client.
+        exec_timeout = max(1, int(phase_timeout))
+        self_deadline = max(1.0, phase_timeout - 10)
+        workdir = f"/tmp/.psbx-{uuid.uuid4().hex}"
+        try:
+            if self._arch is None:
+                self._arch = await self._detect_arch(env, sandbox_state)
+            # Pre-create the workdir so Harbor's primary `docker compose cp`
+            # upload path (which does not create parents) succeeds and we do
+            # not silently depend on the tar-based fallback needing in-image tar.
+            await env.exec(f"mkdir -p {shlex.quote(workdir)}", user="root", timeout_sec=exec_timeout)
+            await env.upload_file(sandbox_state.snapshot_binary_path(self._arch), f"{workdir}/snap")
+            command = f"chmod +x {workdir}/snap && {workdir}/snap {phase} --workdir {shlex.quote(workdir)} --max-seconds {self_deadline:.0f}"
+            if phase == "end":
+                await env.upload_file(
+                    self._host_dir / sandbox_state.BEGIN_MANIFEST,
+                    f"{workdir}/begin.jsonl.gz",
+                )
+                command += f" --begin-manifest {workdir}/begin.jsonl.gz"
+            if self._settings.sandbox_state_exclude:
+                command += f" --exclude {shlex.quote(self._settings.sandbox_state_exclude)}"
+            if self._settings.sandbox_state_hash:
+                command += " --hash"
+            result = await env.exec(command, user="root", timeout_sec=exec_timeout)
+            if result.return_code != 0:
+                stderr_tail = (result.stderr or "").strip()[-500:]
+                raise RuntimeError(f"snapshot exited {result.return_code}: {stderr_tail}")
+            trailer = sandbox_state.parse_trailer(result.stdout or "")
+            for name in _SANDBOX_STATE_OUTPUTS[phase]:
+                target = self._host_dir / name
+                await env.download_file(f"{workdir}/{name}", target)
+                declared = trailer.get("files", {}).get(name, {}).get("sha256")
+                # Hash off the event loop: manifests can be hundreds of MB and
+                # this hook is awaited inline by Harbor's _emit.
+                digest = await asyncio.to_thread(sandbox_state.sha256_file, target)
+                self._integrity[name] = bool(declared) and digest == declared
+            self._trailers[phase] = trailer
+            self._timestamps[phase] = datetime.now(timezone.utc).isoformat()
+        finally:
+            # The container must be left probe-free even when the phase failed;
+            # a dead environment makes this raise, which is fine to swallow. The
+            # timeout keeps a hung `rm` from stalling the trial's own unwind.
+            with contextlib.suppress(Exception):
+                await env.exec(f"rm -rf {shlex.quote(workdir)}", user="root", timeout_sec=exec_timeout)
+
+    async def _detect_arch(self, env: Any, sandbox_state_mod: Any) -> str:
+        machine = ""
+        try:
+            result = await env.exec("uname -m", timeout_sec=30)
+            machine = (result.stdout or "").strip()
+        except Exception as exc:  # noqa: BLE001 - default arch keeps capture best-effort
+            self._errors.append(f"arch detection failed, assuming amd64: {exc}")
+            return "amd64"
+        arch = sandbox_state_mod.machine_to_arch(machine)
+        if arch is None:
+            self._errors.append(f"unrecognized machine {machine!r}, assuming amd64")
+            return "amd64"
+        return arch
+
+    def record_install_failure(self, exc: Exception) -> None:
+        self._errors.append(f"hook install failed: {type(exc).__name__}: {exc}")
+
+    def attempted(self) -> bool:
+        return any(value is not None for value in self.status.values())
+
+    def write_bundle(self, trial_dir: Path) -> dict[str, Any]:
+        """Author the bundle into the host trial tree; sync, never raises.
+
+        Runs via ``asyncio.to_thread`` in the staging path. When no hook ever
+        fired (environment never started, install failed) no files are
+        written — the summary alone records why.
+        """
+        from probe.connectors import sandbox_state
+
+        try:
+            if self.attempted():
+                meta = sandbox_state.build_meta(
+                    begin_trailer=self._trailers.get("begin"),
+                    end_trailer=self._trailers.get("end"),
+                    status=self.status,
+                    begin_at=self._timestamps.get("begin"),
+                    end_at=self._timestamps.get("end"),
+                    arch=self._arch,
+                    integrity=self._integrity,
+                    errors=self._errors,
+                )
+                sandbox_state.write_bundle(
+                    trial_dir / "artifacts" / sandbox_state.BUNDLE_DIRNAME,
+                    {name: self._host_dir / name for outputs in _SANDBOX_STATE_OUTPUTS.values() for name in outputs},
+                    meta,
+                )
+        except Exception as exc:  # noqa: BLE001 - bundle loss must not fail staging
+            logger.exception("sandbox-state bundle write failed")
+            self._errors.append(f"bundle write failed: {type(exc).__name__}: {exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(self._host_dir, ignore_errors=True)
+        return self.summary()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema": "probe.sandbox-state/1",
+            "status": dict(self.status) if self.attempted() else "not_attempted",
+            "arch": self._arch,
+            "integrity": dict(self._integrity),
+            "errors": list(self._errors),
+        }
 
 
 def build_agent_configuration(request: RunRequest) -> tuple[dict[str, str], dict[str, Any]]:
@@ -344,11 +527,7 @@ def build_agent_configuration(request: RunRequest) -> tuple[dict[str, str], dict
         temperature = sampling.get("temperature")
         if isinstance(temperature, int | float) and not isinstance(temperature, bool):
             agent_kwargs["temperature"] = float(temperature)
-        forwarded = {
-            key: value
-            for key, value in sampling.items()
-            if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None
-        }
+        forwarded = {key: value for key, value in sampling.items() if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None}
         if forwarded:
             agent_kwargs["llm_call_kwargs"] = forwarded
 
@@ -435,9 +614,7 @@ async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) ->
             health.raise_for_status()
             actual_id = health.json().get("session_server_instance_id")
             if actual_id != request.session_server_instance_id:
-                raise RuntimeError(
-                    f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})"
-                )
+                raise RuntimeError(f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})")
 
         while True:
             try:
@@ -480,6 +657,19 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         ),
     )
     trial = await Trial.create(config)
+
+    sandbox_capture: SandboxStateCapture | None = None
+    if settings.sandbox_state:
+        capture_root = settings.capture_dir.expanduser().resolve()
+        capture_root.mkdir(parents=True, exist_ok=True)
+        host_dir = Path(tempfile.mkdtemp(prefix=".psbx-host-", dir=capture_root))
+        sandbox_capture = SandboxStateCapture(trial, settings, host_dir)
+        try:
+            sandbox_capture.install()
+        except Exception as exc:  # noqa: BLE001 - capture is best-effort, trial must run
+            logger.exception("sandbox-state hook install failed for %s", request.instance_id)
+            sandbox_capture.record_install_failure(exc)
+
     trial_task = asyncio.create_task(trial.run(), name=f"harbor-trial-{request.instance_id}")
 
     monitor_task: asyncio.Task[int] | None = None
@@ -527,9 +717,7 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         trial_task.cancel()
         if monitor_task is not None:
             monitor_task.cancel()
-        await asyncio.gather(
-            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
-        )
+        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
         response = RunResponse(exit_status="TimeLimitExceeded")
     except asyncio.CancelledError:
         raise
@@ -541,15 +729,22 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             trial_task.cancel()
         if monitor_task is not None and not monitor_task.done():
             monitor_task.cancel()
-        await asyncio.gather(
-            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
-        )
+        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
 
         if settings.capture_mode != "off":
             trial_id = str(trial.id)
             trial_name = str(trial.config.trial_name)
             trial_dir = Path(trial.paths.trial_dir).expanduser().resolve()
             sandbox_id, provider_sandbox_id = _sandbox_correlation(trial)
+            sandbox_state_summary: dict[str, Any] | None = None
+            if sandbox_capture is not None:
+                # Bundle authored into the trial tree BEFORE staging so the
+                # existing stage -> export pipeline carries it untouched.
+                sandbox_state_summary = await asyncio.to_thread(sandbox_capture.write_bundle, trial_dir)
+                request.capture_context = {
+                    **request.capture_context,
+                    "sandbox_state": sandbox_state_summary,
+                }
             try:
                 capture = await asyncio.to_thread(
                     stage_trial_capture,
@@ -574,6 +769,8 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
 
     assert trial_id is not None and trial_name is not None and trial_dir is not None
     assert capture is not None
+    if sandbox_state_summary is not None:
+        capture = capture.model_copy(update={"sandbox_state": sandbox_state_summary})
     resolved_step_index = request.step_index
     if resolved_step_index is None and isinstance(request.rollout_id, int):
         resolved_step_index = request.rollout_id
@@ -608,15 +805,26 @@ def create_app(
     trial_runner: TrialRunner = run_public_harbor_trial,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
+    if settings.sandbox_state:
+        _install_hint = "MILES_SANDBOX_STATE=1 needs probe-research >= 0.9.1 with the packaged probe-sandbox-snapshot binaries. Install from git per requirements-public-harbor-capture.txt (PyPI's 0.9.0 does not carry the binaries)."
+        try:
+            from probe.connectors import sandbox_state as _sandbox_state
+        except ImportError as exc:
+            raise RuntimeError(_install_hint) from exc
+        # Fail fast at startup if the binaries were stripped from the install,
+        # rather than fail-open once per trial with no bundle.
+        try:
+            for _arch in ("amd64", "arm64"):
+                _sandbox_state.snapshot_binary_path(_arch)
+        except FileNotFoundError as exc:
+            raise RuntimeError(_install_hint) from exc
     semaphore = asyncio.Semaphore(settings.max_concurrent)
     active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
     app = FastAPI(title="Miles Public Harbor Bridge")
 
     def require_bearer(http_request: Request, *tokens: str) -> None:
         expected = [f"Bearer {token}" for token in tokens if token]
-        if expected and not any(
-            secrets.compare_digest(http_request.headers.get("authorization", ""), item) for item in expected
-        ):
+        if expected and not any(secrets.compare_digest(http_request.headers.get("authorization", ""), item) for item in expected):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     @app.get("/health")
@@ -626,6 +834,7 @@ def create_app(
             "environment_type": settings.environment_type,
             "max_concurrent": settings.max_concurrent,
             "capture_mode": settings.capture_mode,
+            "sandbox_state": settings.sandbox_state,
         }
         if settings.capture_mode != "off":
             result["capture_dir"] = str(settings.capture_dir.expanduser().resolve())
