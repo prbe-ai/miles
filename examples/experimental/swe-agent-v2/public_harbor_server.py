@@ -585,16 +585,87 @@ def _session_server_url(session_server_id: str) -> str:
     return session_server_id.rstrip("/") if "://" in session_server_id else f"http://{session_server_id}"
 
 
+def _nonempty_identifier(value: Any) -> str | None:
+    """Normalize an SDK identifier without invoking provider methods."""
+    if value is None or callable(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _safe_identifier_attr(value: Any, attribute: str) -> str | None:
+    try:
+        return _nonempty_identifier(getattr(value, attribute, None))
+    except Exception:  # noqa: BLE001 - provider SDK properties are best-effort
+        return None
+
+
+def _provider_sandbox_id(environment: Any) -> str | None:
+    """Read a live provider ID across Harbor's supported cloud backends.
+
+    Harbor intentionally keeps provider handles private. The public bridge only
+    reads stable SDK identifiers while the environment is alive and retains the
+    resulting string; it never calls provider methods or keeps the handle.
+    """
+    if environment is None:
+        return None
+
+    for attribute in ("provider_sandbox_id", "provider_ref"):
+        if provider_id := _safe_identifier_attr(environment, attribute):
+            return provider_id
+
+    # Daytona and E2B use _sandbox (id and sandbox_id respectively), Modal uses
+    # _sandbox.object_id, and Runloop uses _devbox.id.
+    for handle_attribute in ("_sandbox", "_devbox"):
+        try:
+            handle = getattr(environment, handle_attribute, None)
+        except Exception:  # noqa: BLE001 - provider SDK properties are best-effort
+            continue
+        if handle is None:
+            continue
+        for identifier_attribute in ("sandbox_id", "object_id", "id"):
+            if provider_id := _safe_identifier_attr(handle, identifier_attribute):
+                return provider_id
+    return None
+
+
 def _sandbox_correlation(trial: Any) -> tuple[str | None, str | None]:
-    """Return Harbor's logical sandbox ID and a best-effort provider ID."""
+    """Return Harbor's logical sandbox ID and a live best-effort provider ID."""
     environment = getattr(trial, "agent_environment", None)
-    logical_id = getattr(environment, "session_id", None)
-    native_sandbox = getattr(environment, "_sandbox", None)
-    provider_id = getattr(native_sandbox, "id", None)
+    logical_id = _safe_identifier_attr(environment, "session_id")
+    provider_id = _provider_sandbox_id(environment)
     return (
-        str(logical_id) if logical_id is not None else None,
-        str(provider_id) if provider_id is not None else None,
+        logical_id,
+        provider_id,
     )
+
+
+class SandboxCorrelationCapture:
+    """Retain sandbox identifiers before Harbor clears provider handles."""
+
+    def __init__(self, trial: Any) -> None:
+        self._trial = trial
+        self.sandbox_id: str | None = None
+        self.provider_sandbox_id: str | None = None
+
+    def install(self) -> None:
+        from harbor.trial.hooks import TrialEvent
+
+        self._trial.add_hook(TrialEvent.AGENT_START, self._capture)
+        self._trial.add_hook(TrialEvent.AGENT_END, self._capture)
+
+    async def _capture(self, _event: Any) -> None:
+        sandbox_id, provider_sandbox_id = _sandbox_correlation(self._trial)
+        self.sandbox_id = sandbox_id or self.sandbox_id
+        self.provider_sandbox_id = provider_sandbox_id or self.provider_sandbox_id
+
+    def resolved(self) -> tuple[str | None, str | None]:
+        """Prefer retained live values, with a post-run fallback for old Harbor."""
+        sandbox_id, provider_sandbox_id = _sandbox_correlation(self._trial)
+        return (
+            self.sandbox_id or sandbox_id,
+            self.provider_sandbox_id or provider_sandbox_id,
+        )
 
 
 async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) -> int:
@@ -657,6 +728,14 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         ),
     )
     trial = await Trial.create(config)
+
+    sandbox_correlation: SandboxCorrelationCapture | None = None
+    if settings.capture_mode != "off":
+        sandbox_correlation = SandboxCorrelationCapture(trial)
+        try:
+            sandbox_correlation.install()
+        except Exception:  # noqa: BLE001 - metadata must never block a trial
+            logger.exception("sandbox-correlation hook install failed for %s", request.instance_id)
 
     sandbox_capture: SandboxStateCapture | None = None
     if settings.sandbox_state:
@@ -735,7 +814,10 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             trial_id = str(trial.id)
             trial_name = str(trial.config.trial_name)
             trial_dir = Path(trial.paths.trial_dir).expanduser().resolve()
-            sandbox_id, provider_sandbox_id = _sandbox_correlation(trial)
+            if sandbox_correlation is not None:
+                sandbox_id, provider_sandbox_id = sandbox_correlation.resolved()
+            else:
+                sandbox_id, provider_sandbox_id = _sandbox_correlation(trial)
             sandbox_state_summary: dict[str, Any] | None = None
             if sandbox_capture is not None:
                 # Bundle authored into the trial tree BEFORE staging so the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import importlib.util
 import json
 import shutil
@@ -169,6 +170,53 @@ def test_normalize_trial_result() -> None:
     assert response.agent_metrics["agent_run_time"] == 2.0
 
 
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        (SimpleNamespace(_sandbox=SimpleNamespace(id="daytona-1")), "daytona-1"),
+        (SimpleNamespace(_sandbox=SimpleNamespace(sandbox_id="e2b-1")), "e2b-1"),
+        (SimpleNamespace(_sandbox=SimpleNamespace(object_id="sb-modal-1")), "sb-modal-1"),
+        (SimpleNamespace(_devbox=SimpleNamespace(id="dbx-runloop-1")), "dbx-runloop-1"),
+        (SimpleNamespace(provider_ref="provider-ref-1"), "provider-ref-1"),
+    ],
+)
+def test_provider_sandbox_id_supports_cloud_provider_handles(environment, expected: str) -> None:
+    assert server._provider_sandbox_id(environment) == expected
+
+
+@pytest.mark.asyncio
+async def test_sandbox_correlation_is_retained_before_provider_teardown(monkeypatch) -> None:
+    class FakeTrialEvent(enum.Enum):
+        AGENT_START = "agent-start"
+        AGENT_END = "agent-end"
+
+    for package in ("harbor", "harbor.trial"):
+        module = ModuleType(package)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, package, module)
+    hooks_module = ModuleType("harbor.trial.hooks")
+    hooks_module.TrialEvent = FakeTrialEvent
+    monkeypatch.setitem(sys.modules, "harbor.trial.hooks", hooks_module)
+
+    hooks = {event: [] for event in FakeTrialEvent}
+    environment = SimpleNamespace(
+        session_id="logical-session",
+        _sandbox=SimpleNamespace(object_id="sb-modal-live"),
+    )
+    trial = SimpleNamespace(
+        agent_environment=environment,
+        add_hook=lambda event, hook: hooks[event].append(hook),
+    )
+    capture = server.SandboxCorrelationCapture(trial)
+    capture.install()
+
+    for hook in hooks[FakeTrialEvent.AGENT_START]:
+        await hook(SimpleNamespace(event=FakeTrialEvent.AGENT_START))
+    environment._sandbox = None
+
+    assert capture.resolved() == ("logical-session", "sb-modal-live")
+
+
 def test_stage_trial_capture_delegates_native_values_to_probe_sdk(tmp_path: Path, monkeypatch) -> None:
     seen = _install_fake_probe(monkeypatch)
     trial_dir = tmp_path / "trials" / "task__abc"
@@ -256,6 +304,10 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     _install_fake_probe(monkeypatch)
     task_dir = _task_dir(tmp_path)
 
+    class FakeTrialEvent(enum.Enum):
+        AGENT_START = "agent-start"
+        AGENT_END = "agent-end"
+
     class Config:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -272,14 +324,23 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
             self.paths = SimpleNamespace(trial_dir=config.trials_dir / config.trial_name)
             self.agent_environment = SimpleNamespace(
                 session_id=f"{config.trial_name}__env",
-                _sandbox=SimpleNamespace(id="provider-sandbox-id"),
+                _sandbox=SimpleNamespace(object_id="provider-sandbox-id"),
             )
+            self.hooks = {event: [] for event in FakeTrialEvent}
 
         @classmethod
         async def create(cls, config):
             return cls(config)
 
+        def add_hook(self, event, hook):
+            self.hooks[event].append(hook)
+
+        async def emit(self, event):
+            for hook in self.hooks[event]:
+                await hook(SimpleNamespace(event=event))
+
         async def run(self):
+            await self.emit(FakeTrialEvent.AGENT_START)
             self.paths.trial_dir.mkdir(parents=True)
             (self.paths.trial_dir / "agent").mkdir()
             (self.paths.trial_dir / "agent" / "native.log").write_text("native agent log")
@@ -292,13 +353,16 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
                 "verifier_result": {"rewards": {"reward": 1.0}},
             }
             (self.paths.trial_dir / "result.json").write_text(json.dumps(result_doc))
-            return SimpleNamespace(
+            result = SimpleNamespace(
                 verifier_result=SimpleNamespace(rewards={"reward": 1.0}),
                 exception_info=None,
                 agent_result=None,
                 agent_execution=None,
                 verifier=None,
             )
+            await self.emit(FakeTrialEvent.AGENT_END)
+            self.agent_environment._sandbox = None
+            return result
 
     for package in ("harbor", "harbor.models", "harbor.models.trial", "harbor.trial"):
         module = ModuleType(package)
@@ -313,6 +377,9 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     trial_module = ModuleType("harbor.trial.trial")
     trial_module.Trial = FakeTrial
     monkeypatch.setitem(sys.modules, "harbor.trial.trial", trial_module)
+    hooks_module = ModuleType("harbor.trial.hooks")
+    hooks_module.TrialEvent = FakeTrialEvent
+    monkeypatch.setitem(sys.modules, "harbor.trial.hooks", hooks_module)
 
     settings = server.Settings(
         tasks_dir=task_dir.parent,

@@ -8,7 +8,7 @@ Kubernetes (MK8S). It adapts the Runpod workflow to:
 - a Nebius GPU cluster providing InfiniBand/GPUDirect RDMA;
 - a Nebius shared filesystem mounted into both Miles Pods through CSI;
 - one Ray head/Miles control Pod and one Ray worker Pod;
-- Daytona for Harbor task sandboxes; and
+- Modal for Harbor task sandboxes, with Daytona retained as a fallback; and
 - either a public TCP load balancer for the first smoke test or an
   authenticated TLS relay for training.
 
@@ -28,7 +28,7 @@ Complete the experiment gates in this order:
 2. two healthy GPU nodes;
 3. official two-node NCCL/InfiniBand test;
 4. shared-filesystem cross-node sentinel test;
-5. Harbor/Daytona oracle trial;
+5. Harbor/Modal oracle trial;
 6. one real Mini-SWE-Agent model rollout;
 7. one fully async two-node rollout;
 8. the authenticated TLS callback test; and
@@ -64,7 +64,7 @@ Nebius project (eu-north1)
     exposed through Nebius CSI as one ReadWriteMany PVC
     mounted inside both Miles Pods at /workspace
 
-Daytona
+Modal
   short-lived Harbor task sandboxes
   agent calls the externally advertised Miles session URL
 ```
@@ -101,7 +101,7 @@ Miles image tag or immutable digest:
 Miles git branch and commit:
 Callback mode for smoke: public LoadBalancer or relay:
 Production callback DNS name / relay host:
-Daytona concurrency quota:
+Modal account, token pair, and intended concurrency:
 HF checkpoint path:
 Converted Megatron checkpoint path:
 W&B project and run name:
@@ -552,11 +552,13 @@ mode `0600`; do not commit or paste it into run notes:
 umask 077
 export AGENT_SERVER_AUTH_TOKEN="$(openssl rand -hex 32)"
 export MILES_SESSION_API_KEY="$(openssl rand -hex 32)"
+read -rsp 'Probe write token: ' PROBE_TOKEN
+echo
 
 cat > /tmp/miles-secrets.env <<EOF
-DAYTONA_API_KEY=<daytona-key>
 HF_TOKEN=<hugging-face-token>
 WANDB_API_KEY=<wandb-key-or-empty>
+PROBE_TOKEN=$PROBE_TOKEN
 MILES_HARBOR_AUTH_TOKEN=$AGENT_SERVER_AUTH_TOKEN
 AGENT_SERVER_AUTH_TOKEN=$AGENT_SERVER_AUTH_TOKEN
 MILES_SESSION_API_KEY=$MILES_SESSION_API_KEY
@@ -573,6 +575,128 @@ kubectl create secret generic miles-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 
 rm /tmp/miles-secrets.env
+unset PROBE_TOKEN
+```
+
+Create a separate Modal credential Secret. This preserves `miles-secrets`
+unchanged during future provider credential rotations and never puts either
+Modal token in a command argument or local file:
+
+1. In the Modal workspace settings, create an API token or, preferably, a
+   dedicated service user for this run.
+2. If Modal RBAC is enabled, grant that service user `Contributor` access to
+   the intended Modal Environment (`main` unless deliberately changed).
+3. Copy the API token ID (`ak-...`) and secret (`as-...`) when shown. Do not use
+   Modal proxy tokens (`wk-...` / `ws-...`); those authenticate Web Functions,
+   not the SDK that creates Sandboxes.
+
+See [Modal service users](https://modal.com/docs/guide/service-users) and
+[Modal client configuration](https://modal.com/docs/sdk/py/latest/config).
+
+```bash
+read -rsp 'Modal token ID: ' MODAL_TOKEN_ID
+echo
+read -rsp 'Modal token secret: ' MODAL_TOKEN_SECRET
+echo
+
+printf 'MODAL_TOKEN_ID=%s\nMODAL_TOKEN_SECRET=%s\n' \
+  "$MODAL_TOKEN_ID" "$MODAL_TOKEN_SECRET" |
+  kubectl create secret generic modal-credentials \
+    --namespace miles \
+    --from-env-file=/dev/stdin \
+    --dry-run=client -o yaml |
+  kubectl apply -f -
+
+unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
+
+kubectl get secret modal-credentials -n miles \
+  -o go-template='{{if and (index .data "MODAL_TOKEN_ID") (index .data "MODAL_TOKEN_SECRET")}}modal_credentials=present{{else}}modal_credentials=absent{{end}}{{"\n"}}'
+```
+
+For the durable cluster variant that reuses the existing `miles-dev`
+Deployment as the Ray head, wire the Secret references into its Pod template
+**while the GPU node group is still down**. Updating the template creates a
+new ReplicaSet; do not run these commands from a live in-Pod session:
+
+```bash
+kubectl --context nebius-miles patch deployment miles-dev \
+  --namespace miles \
+  --type merge \
+  --patch \
+  '{"spec":{"template":{"metadata":{"labels":{"miles.prbe.ai/ray-role":"head"}}}}}'
+
+kubectl --context nebius-miles set env deployment/miles-dev \
+  --namespace miles \
+  --from=secret/miles-secrets \
+  --keys=PROBE_TOKEN
+
+kubectl --context nebius-miles set env deployment/miles-dev \
+  --namespace miles \
+  --from=secret/modal-credentials \
+  --keys=MODAL_TOKEN_ID,MODAL_TOKEN_SECRET
+
+kubectl --context nebius-miles set env deployment/miles-dev \
+  --namespace miles \
+  HARBOR_ENVIRONMENT_TYPE=modal \
+  'MILES_HARBOR_ENVIRONMENT_KWARGS_JSON={"sandbox_timeout_secs":14400}' \
+  HARBOR_DELETE_ENVIRONMENTS=true
+
+kubectl --context nebius-miles set env deployment/miles-dev \
+  --namespace miles --list |
+  grep -E '^(PROBE_TOKEN|MODAL_TOKEN_ID|MODAL_TOKEN_SECRET|HARBOR_ENVIRONMENT_TYPE|MILES_HARBOR_ENVIRONMENT_KWARGS_JSON)='
+
+test "$(
+  kubectl --context nebius-miles get deployment miles-dev \
+    --namespace miles \
+    -o jsonpath='{.spec.template.metadata.labels.miles\.prbe\.ai/ray-role}'
+)" = "head"
+```
+
+The listing prints Secret references rather than Secret values. After the node
+group returns, require the replacement `miles-dev` Pod to be Ready and the
+`miles-head` EndpointSlice to resolve to its Pod IP before starting Ray or
+Harbor. Putting the head label on the Deployment template prevents the Service
+endpoint from disappearing on every rollout.
+
+For that durable Deployment, use this macOS-compatible discovery gate after
+the node group becomes Ready:
+
+```bash
+kubectl --context nebius-miles rollout status deployment/miles-dev \
+  --namespace miles --timeout=15m
+
+export HEAD_POD="$(
+  kubectl --context nebius-miles get pods --namespace miles \
+    -l app=miles-dev \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
+  awk 'NF{print; exit}'
+)"
+test -n "$HEAD_POD"
+
+kubectl --context nebius-miles wait --namespace miles \
+  --for=condition=Ready "pod/$HEAD_POD" --timeout=10m
+
+export HEAD_IP="$(
+  kubectl --context nebius-miles get pod --namespace miles "$HEAD_POD" \
+    -o jsonpath='{.status.podIP}'
+)"
+export SERVICE_ENDPOINT="$(
+  kubectl --context nebius-miles get endpointslice --namespace miles \
+    -l kubernetes.io/service-name=miles-head \
+    -o jsonpath='{range .items[*].endpoints[*].addresses[*]}{.}{"\n"}{end}' |
+  awk 'NF{print; exit}'
+)"
+test -n "$HEAD_IP"
+test "$SERVICE_ENDPOINT" = "$HEAD_IP"
+
+kubectl --context nebius-miles exec --namespace miles "$HEAD_POD" -- \
+  sh -lc '
+    test -n "${PROBE_TOKEN:-}"
+    test -n "${MODAL_TOKEN_ID:-}"
+    test -n "${MODAL_TOKEN_SECRET:-}"
+    test "${HARBOR_ENVIRONMENT_TYPE:-}" = modal
+    printf "modal_and_probe_credentials=present\n"
+  '
 ```
 
 Kubernetes Secrets are not a substitute for organization-wide secret
@@ -639,6 +763,8 @@ spec:
       envFrom:
         - secretRef:
             name: miles-secrets
+        - secretRef:
+            name: modal-credentials
       env:
         - name: POD_IP
           valueFrom:
@@ -665,9 +791,9 @@ spec:
         - name: MILES_SESSION_SERVER_BIND_IP
           value: 0.0.0.0
         - name: HARBOR_ENVIRONMENT_TYPE
-          value: daytona
+          value: modal
         - name: MILES_HARBOR_ENVIRONMENT_KWARGS_JSON
-          value: "{}"
+          value: '{"sandbox_timeout_secs":14400}'
         - name: HARBOR_DELETE_ENVIRONMENTS
           value: "true"
         - name: AGENT_MAX_CONCURRENT
@@ -830,7 +956,9 @@ Use the commit recorded before provisioning. Install the shared source
 editable into each Pod's local Python environment, sequentially:
 
 ```bash
-kubectl exec -n miles miles-head -- \
+export HEAD_POD="${HEAD_POD:-miles-head}"
+
+kubectl exec -n miles "$HEAD_POD" -- \
   pip install -e /workspace/miles --no-deps
 
 kubectl exec -n miles miles-worker -- \
@@ -844,29 +972,37 @@ tracking init. Install the git pin (probe-research 0.9.1, binaries committed,
 no Go toolchain) on both Pods:
 
 ```bash
-kubectl exec -n miles miles-head -- \
+kubectl exec -n miles "$HEAD_POD" -- \
   pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
 
 kubectl exec -n miles miles-worker -- \
   pip install "probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main"
 ```
 
-Install the isolated Harbor/Daytona venv on the head only:
+Install the isolated Harbor/Modal venv on the head only. Use a new path rather
+than modifying the validated Daytona environment; this keeps rollback
+possible and lets Modal's dependency set remain independently pinned:
 
 ```bash
-kubectl exec -it -n miles miles-head -- bash
+export HEAD_POD="${HEAD_POD:-miles-head}"
+kubectl exec -it -n miles "$HEAD_POD" -- bash
 
 cd /workspace/miles
-export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
+export HARBOR_VENV=/workspace/venvs/harbor-0.18-modal
 uv venv "$HARBOR_VENV" --python 3.12
 # requirements-public-harbor-capture.txt pulls probe-research (0.9.1, with the
 # packaged sandbox-snapshot binaries) from git. WITHOUT it the bridge raises at
 # startup under MILES_HARBOR_CAPTURE_MODE!=off or MILES_SANDBOX_STATE=1, and the
 # `probe` CLI (watcher, below) is absent.
 uv pip install --python "$HARBOR_VENV/bin/python" \
-  -r examples/experimental/swe-agent-v2/requirements-runpod.txt \
+  -r examples/experimental/swe-agent-v2/requirements-nebius-modal.txt \
   -r examples/experimental/swe-agent-v2/requirements-public-harbor-capture.txt \
   pytest pytest-asyncio ruff
+
+test -n "${MODAL_TOKEN_ID:-}"
+test -n "${MODAL_TOKEN_SECRET:-}"
+"$HARBOR_VENV/bin/python" -c \
+  'from importlib import metadata; import modal; print("harbor", metadata.version("harbor")); print("modal", metadata.version("modal")); print("modal_module", modal.__file__)'
 
 python examples/experimental/swe-agent-v2/runpod_preflight.py --phase repo
 "$HARBOR_VENV/bin/python" -m pytest -q \
@@ -933,13 +1069,13 @@ kubectl port-forward -n miles service/miles-head 8265:8265
 
 Do not expose Ray port `6379` or dashboard `8265` publicly.
 
-## 15. Start and oracle-smoke the Daytona Harbor bridge
+## 15. Start and oracle-smoke the Modal Harbor bridge
 
 Inside the head Pod:
 
 ```bash
 export MILES_ROOT=/workspace/miles
-export HARBOR_VENV=/workspace/venvs/harbor-0.18-daytona
+export HARBOR_VENV=/workspace/venvs/harbor-0.18-modal
 export HARBOR_DATA_ROOT=/workspace/harbor
 export HARBOR_TASKS_DIR="$HARBOR_DATA_ROOT/tasks/terminal-bench-2"
 export HARBOR_TRIALS_DIR="$HARBOR_DATA_ROOT/trials"
@@ -951,12 +1087,18 @@ export MILES_HARBOR_CAPTURE_MODE=shadow
 # Requires probe-research >= 0.9.1 (packaged probe-sandbox-snapshot binaries;
 # PyPI's 0.9.0 shipped without them — install from git, see the capture reqs).
 export MILES_SANDBOX_STATE=1
-export HARBOR_ENVIRONMENT_TYPE=daytona
-export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{}'
+export HARBOR_ENVIRONMENT_TYPE=modal
+# Keep the provider lifetime aligned with the four-hour bridge/client timeout.
+# Modal supports up to 24 hours, but a bounded value limits leaked compute.
+export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{"sandbox_timeout_secs":14400}'
 export HARBOR_DELETE_ENVIRONMENTS=true
 export AGENT_MAX_CONCURRENT=1
 export MILES_HARBOR_REQUEST_TIMEOUT_SEC=14400
 export AGENT_SERVER_URL=http://miles-head.miles.svc.cluster.local:18080
+
+: "${MODAL_TOKEN_ID:?MODAL_TOKEN_ID is absent from the head Pod}"
+: "${MODAL_TOKEN_SECRET:?MODAL_TOKEN_SECRET is absent from the head Pod}"
+: "${PROBE_TOKEN:?PROBE_TOKEN is absent from the head Pod}"
 
 mkdir -p /workspace/logs "$HARBOR_TRIALS_DIR" "$MILES_HARBOR_CAPTURE_DIR"
 nohup "$HARBOR_VENV/bin/python" \
@@ -973,7 +1115,6 @@ this process validates and uploads them without adding network latency to
 `Trial.run()`:
 
 ```bash
-export PROBE_TOKEN='<write token from the Kubernetes secret>'
 # Use the Harbor venv's probe CLI (that is where probe-research was installed).
 nohup "$HARBOR_VENV/bin/probe" trial watch "$MILES_HARBOR_CAPTURE_DIR" --interval 5 \
   >/workspace/logs/probe-harbor-export.log 2>&1 &
@@ -991,8 +1132,39 @@ the agent's delta tarball, captured inside the sandbox at `AGENT_START` /
 the same instant (the sandbox is probe-free during the whole agent phase).
 
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
-`Submitted`, verifier output, and Daytona cleanup. This still does not prove
-the model callback.
+`Submitted`, verifier output, a nonempty `provider_sandbox_id`, and Modal
+cleanup. This still does not prove the model callback.
+
+The bridge retains the provider ID during Harbor `AGENT_START`/`AGENT_END`,
+before Harbor clears the Modal SDK handle. For Modal the response ID is
+`Sandbox.object_id` and normally begins with `sb-`. Save the oracle response as
+`$ORACLE_JSON`, then prove that exact Sandbox disappears:
+
+```bash
+export PROVIDER_SANDBOX_ID="$(
+  python -c 'import json,os; print(json.load(open(os.environ["ORACLE_JSON"]))["provider_sandbox_id"])'
+)"
+test -n "$PROVIDER_SANDBOX_ID"
+
+"$HARBOR_VENV/bin/python" - "$PROVIDER_SANDBOX_ID" <<'PY'
+import sys
+import time
+
+import modal
+
+provider_id = sys.argv[1]
+for _ in range(24):
+    live_ids = {sandbox.object_id for sandbox in modal.Sandbox.list()}
+    if provider_id not in live_ids:
+        print("modal_cleanup=passed", "provider_sandbox_id", provider_id)
+        break
+    time.sleep(5)
+else:
+    raise AssertionError(
+        f"Modal Sandbox {provider_id} still exists after 120 seconds"
+    )
+PY
+```
 
 **Sandbox-capture self-check (couple this to the oracle smoke).** Once the
 oracle trial has staged, validate its bundle with the shipped checker
@@ -1030,12 +1202,11 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    app: miles
-    role: head
+    miles.prbe.ai/ray-role: head
   ports:
-    - name: session
+    - name: http-session
       protocol: TCP
-      port: 30000
+      port: 80
       targetPort: 30000
 YAML
 
@@ -1057,13 +1228,25 @@ Use this only for the initial smoke:
 ```bash
 export MILES_SESSION_SERVER_PORT=30000
 export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
-export MILES_ROUTER_EXTERNAL_HOST="$MILES_PUBLIC_IP"
+export MILES_ROUTER_EXTERNAL_BASE_URL="http://$MILES_PUBLIC_IP"
+unset MILES_ROUTER_EXTERNAL_HOST
 export MILES_HARBOR_ALLOWED_CALLBACK_HOSTS="$MILES_PUBLIC_IP,localhost,127.0.0.1"
 ```
 
 The Miles session server enforces `MILES_SESSION_API_KEY`, but direct traffic
 is still plain HTTP. Restart the bridge after changing its callback allowlist.
 Do not use this path for sensitive or long-running training.
+
+Modal Sandboxes allow outbound access to public IPs by default, so this path
+does not require a provider-tier egress upgrade. The callback must still be
+publicly routable, included in `MILES_HARBOR_ALLOWED_CALLBACK_HOSTS`, and
+authenticated with `MILES_SESSION_API_KEY`. Do not confuse Modal's outbound
+access with an inbound route to the Kubernetes ClusterIP Service; a remote
+Sandbox cannot resolve `*.svc.cluster.local`.
+
+If Daytona is deliberately selected as the fallback provider, its
+organization must still be Tier 3 or higher for this callback path. See
+[Daytona network limits](https://www.daytona.io/docs/en/network-limits/).
 
 ### Production TLS callback
 
@@ -1093,7 +1276,13 @@ Open a shell in the head Pod and export the same model/task variables used by
 the Runpod guide:
 
 ```bash
-kubectl exec -it -n miles miles-head -- bash
+export HEAD_POD="$(
+  kubectl get pods -n miles \
+    -l miles.prbe.ai/ray-role=head \
+    -o jsonpath='{.items[0].metadata.name}'
+)"
+test -n "$HEAD_POD"
+kubectl exec -it -n miles "$HEAD_POD" -- bash
 
 cd /workspace/miles
 export RAY_ADDRESS=http://127.0.0.1:8265
@@ -1108,8 +1297,8 @@ export MILES_SESSION_SERVER_BIND_IP=0.0.0.0
 For direct smoke:
 
 ```bash
-export MILES_ROUTER_EXTERNAL_HOST='<LoadBalancer external IP>'
-unset MILES_ROUTER_EXTERNAL_BASE_URL
+export MILES_ROUTER_EXTERNAL_BASE_URL='http://<LoadBalancer external IP>'
+unset MILES_ROUTER_EXTERNAL_HOST
 ```
 
 For relay/TLS:
@@ -1131,9 +1320,10 @@ Run section 13 of `RUNPOD_E2E.md` for exactly one colocated
 Then run section 14's fully async two-node debug command with the same changes.
 The gate succeeds only when:
 
-- RolloutManager/session server is in `miles-head`;
+- RolloutManager/session server is in the head Pod selected by
+  `miles.prbe.ai/ray-role=head`;
 - Ray reports 16 GPUs across two nodes;
-- Daytona calls the advertised `/sessions/<id>/v1/chat/completions` URL;
+- Modal calls the advertised `/sessions/<id>/v1/chat/completions` URL;
 - Miles records and collects at least one model turn;
 - Harbor returns `Submitted` and verifier output;
 - no session identity, auth, NCCL, storage, or cleanup failure occurs.
@@ -1187,13 +1377,13 @@ kubectl exec -n miles miles-head -- df -h /workspace
 ```
 
 Do not leave the first iteration unattended. Require the first rollout, GRPO
-step 0, trace write, and checkpoint write before increasing Daytona
+step 0, trace write, and checkpoint write before increasing Modal
 concurrency above one.
 
 The experiment is complete only when the logs and durable outputs prove all of
 the following for the same run:
 
-- Harbor launched the selected task in Daytona and returned a non-aborted
+- Harbor launched the selected task in Modal and returned a non-aborted
   rollout to Miles;
 - Miles consumed that rollout in normal mode and completed one optimizer step;
 - updated policy weights were transferred to or acknowledged by the rollout
@@ -1250,8 +1440,11 @@ failed validation; changing it to 2 exposed the subsequent gradient-buffer OOM.
 | Docker Hub pull is throttled | Mirror the Miles image into Nebius Container Registry and pin its digest. |
 | Both Miles Pods land on one node | Verify eight-GPU requests and required pod anti-affinity. |
 | Ray sees fewer than 16 GPUs | Fix Pod GPU visibility or Ray membership before launch. |
-| Daytona cannot reach the callback | Check public Service/relay, allowlist, bearer, DNS, and session bind address. |
-| Callback returns 401 | Confirm the same `MILES_SESSION_API_KEY` reaches Miles, Harbor monitor, and Daytona agent. |
+| Modal cannot reach the callback | Check the public Service/relay, bridge callback allowlist, bearer, DNS, and session bind address; a Modal Sandbox cannot use Kubernetes ClusterIP DNS. |
+| Modal authentication fails | Confirm both `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are present in the head Pod and were issued for the intended workspace. |
+| Modal Sandbox remains after a trial | Stop before training; require `HARBOR_DELETE_ENVIRONMENTS=true`, inspect the bridge log, and terminate the leaked `provider_sandbox_id`. |
+| Daytona fallback reports Internet is restricted on Tier 1 or Tier 2 | Upgrade the Daytona organization to Tier 3 or higher; sandbox-level allowlists cannot override the organization policy. |
+| Callback returns 401 | Confirm the same `MILES_SESSION_API_KEY` reaches Miles, Harbor monitor, and the Modal agent. |
 | Callback returns a session 404/identity mismatch | Stop: traffic reached the wrong or restarted session server. |
 | Shared filesystem is slow | Benchmark it and revisit filesystem size/type; do not assume capacity alone implies required bandwidth. |
 | Head Pod restarts | Treat the training job/session state as interrupted; do not silently continue mixed rollouts. |
@@ -1260,7 +1453,7 @@ failed validation; changing it to 2 exposed the subsequent gradient-buffer OOM.
 
 ## 20. Stop and tear down safely
 
-Stop the Ray job first and allow Harbor/Daytona cleanup:
+Stop the Ray job first and allow Harbor/Modal cleanup:
 
 ```bash
 kubectl exec -n miles miles-head -- \
@@ -1302,7 +1495,7 @@ Before creating the Nebius cluster, provide or confirm:
 8. Whether `radixark/miles:latest` may be pulled from Docker Hub or must be
    mirrored into Nebius Container Registry; ideally provide a pinned digest.
 9. The exact Miles commit to run.
-10. Daytona account/API key and expected maximum concurrency.
+10. Modal workspace token ID/secret and expected maximum concurrency.
 11. HF model access and whether the model is already staged anywhere.
 12. Production callback choice: existing relay VM/domain or a new Nebius TLS
     endpoint, including DNS ownership.
@@ -1411,7 +1604,7 @@ with Client() as probe:
         hypothesis="A full-resource two-node H100 MK8S deployment can pass the Harbor oracle and distributed communication gates.",
         name="nebius-e2e-<utc-timestamp>",
         external_id="nebius-e2e-<stable-id>",
-        tags=["nebius", "mk8s", "h100", "harbor", "daytona"],
+        tags=["nebius", "mk8s", "h100", "harbor", "modal"],
     )
     run.snapshot(cwd="/workspace/miles", include_env=True, include_gpu=True)
     run.log({"nccl_bus_gbps": 414.57, "harbor_reward": 1.0}, step=0,
@@ -1454,14 +1647,16 @@ creates the default Harbor trial span, uploads every regular file with its
 rollout step/correlation metadata, and updates the local publication ledger.
 No client-specific `manifest.json` edit and no ATIF conversion are required.
 
-Harbor's `HARBOR_DELETE_ENVIRONMENTS=true` correctly cleaned the Daytona
-sandbox after the oracle. That means the durable upload is the collected
-trial bundle (`agent/oracle.txt`, `result.json`, verifier output, config/lock,
-and manifest), not the original sandbox filesystem. If a future run requires
-reproducible sandbox inspection, set deletion off only for a bounded debug
-trial, collect the sandbox directory explicitly, and delete it after the
-upload. Uploading a directory requires archiving it first; `log_artifact`
-uploads bytes when given a file path and otherwise records only a reference.
+Harbor's `HARBOR_DELETE_ENVIRONMENTS=true` correctly cleaned the historical
+Daytona oracle sandbox. The Modal gate in section 15 now requires the same
+cleanup proof for the exact retained `provider_sandbox_id`. The durable upload
+is the collected trial bundle (`agent/oracle.txt`, `result.json`, verifier
+output, config/lock, and manifest), not the original sandbox filesystem. If a
+future run requires reproducible sandbox inspection, set deletion off only for
+a bounded debug trial, collect the sandbox directory explicitly, and delete it
+after the upload. Uploading a directory requires archiving it first;
+`log_artifact` uploads bytes when given a file path and otherwise records only
+a reference.
 
 Verified Research OS behavior after the 2026-07-13 agent and service fixes:
 
@@ -1485,7 +1680,7 @@ Remaining instrumentation considerations:
    Harbor can pass its oracle while a real agent turn still cannot call Miles.
 2. A single high-level `snapshot` captures code, dependencies, GPU metadata,
    and an execution record, but not Kubernetes YAML, Pod events, NCCL logs, or
-   Daytona sandbox contents. Add those as explicit files and link the cluster,
+   cloud sandbox contents. Add those as explicit files and link the cluster,
    node-group, GPU-cluster, Pod, and filesystem IDs.
 3. The hosted MCP health endpoint is reachable, but a direct streamable-HTTP
    probe returned `Session not found` on `tools/list`; restart Claude Code so

@@ -162,8 +162,8 @@ The checked-in synchronous and GLM-4.7-Flash async launchers now propagate it.
 They also default `AGENT_SERVER_TIMEOUT_SEC` to four hours so a valid long
 Terminal-Bench trial is not cut off by the client after exactly one hour.
 `MILES_SESSION_API_KEY` is a separate credential for the model/session
-callback. The launchers propagate it to the Miles session server, Daytona
-agent, and Harbor session monitor; do not reuse the bridge credential.
+callback. The launchers propagate it to the Miles session server, cloud
+sandbox agent, and Harbor session monitor; do not reuse the bridge credential.
 
 Public Harbor 0.18.0's Mini-SWE-Agent adapter accepts `max_tokens` and
 `reasoning_effort`, but not a per-trial `temperature`; the bridge therefore
@@ -172,13 +172,34 @@ the additional sampling fields mapped by the bridge.
 
 For a cloud sandbox provider, install the corresponding Harbor extra and set
 `HARBOR_ENVIRONMENT_TYPE` plus `MILES_HARBOR_ENVIRONMENT_KWARGS_JSON`. Docker
-remains the closest path for a local bridge smoke test. On a Runpod Instant
-Cluster or Nebius MK8S cluster where Docker is unavailable inside the GPU
-workload, or on standalone Nebius VMs where task sandboxes should stay outside
-the training hosts, use `harbor[daytona]`, set
-`HARBOR_ENVIRONMENT_TYPE=daytona`, and follow the matching provider runbook.
-Each guide includes the separate external callback route that a Daytona
-sandbox needs to reach the Miles session server.
+remains the closest path for a local bridge smoke test. The supported Nebius
+path uses Modal so task sandboxes stay outside the GPU hosts:
+
+```bash
+uv pip install --python "$HARBOR_VENV/bin/python" \
+  -r examples/experimental/swe-agent-v2/requirements-nebius-modal.txt
+export HARBOR_ENVIRONMENT_TYPE=modal
+export MILES_HARBOR_ENVIRONMENT_KWARGS_JSON='{"sandbox_timeout_secs":14400}'
+```
+
+Modal authentication uses `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. Put both
+in a Kubernetes Secret and inject them into the head Pod; never place them in
+the runbook, task environment, callback payload, or logs. Harbor creates one
+`__harbor__` Modal App, imports each task's configured image or Dockerfile,
+and terminates the Sandbox when `HARBOR_DELETE_ENVIRONMENTS=true`.
+
+Daytona remains available as a fallback with `harbor[daytona]` and
+`HARBOR_ENVIRONMENT_TYPE=daytona`. E2B and Runloop are also Harbor backends,
+but their entry-tier lifetime/resource or blueprint limits do not cover the
+complete Terminal-Bench 2 run without a paid plan or provider-specific
+changes. Each cloud-provider guide must include a separately authenticated,
+public callback route from the sandbox to the Miles session server.
+
+Provider sandbox IDs are retained at Harbor `AGENT_START`/`AGENT_END`, before
+Harbor clears the live SDK handle. The bridge recognizes Daytona `id`, E2B
+`sandbox_id`, Modal `object_id`, and Runloop Devbox `id`. The identifier is
+observability metadata only; execution, verifier rewards, staged captures,
+and cleanup remain provider-neutral.
 
 ## Remaining validation before GPU training
 
