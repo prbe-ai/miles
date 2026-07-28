@@ -80,11 +80,12 @@ async def run_oracle_capture(
     return await bridge.run_public_harbor_trial(request, settings)
 
 
-def solution_writes(task_dir: Path) -> list[str]:
-    """Best-effort: the absolute paths a task's solve.sh writes, for delta asserts.
+def _solution_paths(task_dir: Path) -> tuple[list[str], list[str]]:
+    """Best-effort ``(writes, deletes)`` absolute paths out of a task's solve.sh.
 
-    Parses ``> /path`` and ``cp ... /path`` redirects out of solve.sh. Not a
-    shell interpreter — just enough to assert the sandbox delta captured them.
+    Parses ``> /path`` / ``cp ... /path`` style tokens for writes and ``rm``
+    command targets for deletes. Not a shell interpreter — just enough to
+    assert the sandbox delta captured them.
     """
     solve = None
     for candidate in (task_dir / "solution" / "solve.sh", task_dir / "solution" / "solve.bat"):
@@ -92,13 +93,31 @@ def solution_writes(task_dir: Path) -> list[str]:
             solve = candidate
             break
     if solve is None:
-        return []
-    paths: list[str] = []
+        return [], []
+    writes: list[str] = []
+    deletes: list[str] = []
     for line in solve.read_text().splitlines():
         line = line.strip()
         if line.startswith("#") or not line:
             continue
-        for token in line.split():
+        tokens = line.split()
+        target = deletes if tokens[0] == "rm" else writes
+        for token in tokens:
             if token.startswith("/") and "." in token.rsplit("/", 1)[-1]:
-                paths.append(token)
-    return sorted(set(paths))
+                target.append(token)
+    return sorted(set(writes)), sorted(set(deletes))
+
+
+def solution_writes(task_dir: Path) -> list[str]:
+    """Absolute paths solve.sh writes — expected present in the end manifest."""
+    return _solution_paths(task_dir)[0]
+
+
+def solution_deletes(task_dir: Path) -> list[str]:
+    """Absolute paths solve.sh deletes.
+
+    probe.sandbox-state/1 stores no tombstones: a deletion is derived (path in
+    the begin manifest, absent from the end manifest), so these must NOT be
+    asserted against the end manifest.
+    """
+    return _solution_paths(task_dir)[1]

@@ -31,12 +31,14 @@ def _bundle(root: Path, *, meta: dict | None, manifests: bool = True) -> Path:
 
 
 def _healthy_meta() -> dict:
+    # SDK-shaped meta (probe-research >= 0.23.0 SandboxStateRecorder): phase
+    # statuses are pending/ok/failed and integrity is the two booleans.
     return {
         "schema": "probe.sandbox-state/1",
         "tool": {"arch": "amd64"},
         "status": {"begin": "ok", "end": "ok"},
         "summary": {"begin_files": 92, "added": 2, "modified": 1, "deleted": 0},
-        "integrity": {"begin-manifest.jsonl.gz": True, "end-manifest.jsonl.gz": True, "end-delta.tar.gz": True},
+        "integrity": {"begin_verified": True, "end_verified": True},
         "limits": {"truncated": False},
     }
 
@@ -58,7 +60,7 @@ def test_no_bundle_is_exit_2(tmp_path):
 
 def test_integrity_mismatch_warns_but_fails_when_required(tmp_path):
     meta = _healthy_meta()
-    meta["integrity"]["end-delta.tar.gz"] = False
+    meta["integrity"]["end_verified"] = False
     root = _bundle(tmp_path, meta=meta)
     assert _run(csb, [str(root)]) == 0  # warn only
     assert _run(csb, [str(root), "--require-integrity"]) == 1  # hard fail
@@ -66,7 +68,7 @@ def test_integrity_mismatch_warns_but_fails_when_required(tmp_path):
 
 def test_bad_status_fails(tmp_path):
     meta = _healthy_meta()
-    meta["status"]["end"] = "TimeoutError: end phase"
+    meta["status"]["end"] = "failed"
     root = _bundle(tmp_path, meta=meta)
     assert _run(csb, [str(root)]) == 1
 

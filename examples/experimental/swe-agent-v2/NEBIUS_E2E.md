@@ -995,8 +995,8 @@ kubectl exec -it -n miles "$HEAD_POD" -- bash
 cd /workspace/miles
 export HARBOR_VENV=/workspace/venvs/harbor-0.18-modal
 uv venv "$HARBOR_VENV" --python 3.12
-# requirements-public-harbor-capture.txt pulls probe-research (0.9.1, with the
-# packaged sandbox-snapshot binaries) from git. WITHOUT it the bridge raises at
+# requirements-public-harbor-capture.txt pulls probe-research (>= 0.23.0 — the
+# harbor_capture facade — with the packaged sandbox-snapshot binaries) from git. WITHOUT it the bridge raises at
 # startup under MILES_HARBOR_CAPTURE_MODE!=off or MILES_SANDBOX_STATE=1, and the
 # `probe` CLI (watcher, below) is absent.
 uv pip install --python "$HARBOR_VENV/bin/python" \
@@ -1089,8 +1089,8 @@ export MILES_HARBOR_CAPTURE_DIR="$HARBOR_DATA_ROOT/captures"
 # this the bridge stages nothing and the watcher below has nothing to export.
 export MILES_HARBOR_CAPTURE_MODE=shadow
 # Ephemeral begin/end sandbox filesystem snapshots (probe.sandbox-state/1).
-# Requires probe-research >= 0.9.1 (packaged probe-sandbox-snapshot binaries;
-# PyPI's 0.9.0 shipped without them — install from git, see the capture reqs).
+# Requires probe-research >= 0.23.0 (harbor_capture facade + packaged
+# probe-sandbox-snapshot binaries — install from git, see the capture reqs).
 export MILES_SANDBOX_STATE=1
 export HARBOR_ENVIRONMENT_TYPE=modal
 # Keep the provider lifetime aligned with the four-hour bridge/client timeout.

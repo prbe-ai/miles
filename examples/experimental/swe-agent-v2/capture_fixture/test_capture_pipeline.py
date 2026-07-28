@@ -137,6 +137,14 @@ def test_oracle_capture_reflects_sandbox_changes(tmp_path, sandbox):
     for expected in oracle_capture.solution_writes(SANDBOXES / sandbox):
         assert expected in end_manifest, f"{sandbox}: {expected} not in end manifest"
 
+    # Deletions are derived, not stored (probe.sandbox-state/1 keeps no
+    # tombstones): a deleted path is in the begin manifest and gone from the
+    # end manifest.
+    begin_manifest = _read_manifest(bundle / "begin-manifest.jsonl.gz")
+    for expected in oracle_capture.solution_deletes(SANDBOXES / sandbox):
+        assert expected in begin_manifest, f"{sandbox}: {expected} not in begin manifest"
+        assert expected not in end_manifest, f"{sandbox}: deleted {expected} still in end manifest"
+
 
 def _run_checker(csb, capture_dir) -> int:
     argv = sys.argv
