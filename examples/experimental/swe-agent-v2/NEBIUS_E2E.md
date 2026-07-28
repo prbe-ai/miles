@@ -968,8 +968,13 @@ kubectl exec -n miles miles-worker -- \
 Probe metric tracking (`MILES_USE_PROBE=1`, section 18/23) needs the Probe
 SDK in **each training environment** — `ProbeBackend` imports
 `probe.integrations.miles`, so without this the training run raises at
-tracking init. Install the git pin (probe-research 0.9.1, binaries committed,
-no Go toolchain) on both Pods:
+tracking init. The floor is **probe-research >= 0.22.0**: 0.22.0 added the
+per-sample rollout rail (section 18/23) and fixed a trajectory-capture bug
+(0.21.0 and earlier sent `coords: null` in expanded trajectory span batches,
+which the 0059+ server rejects with a 422 — any capture of a recognized
+trajectory failed mid-flight). The `@main` git pin below satisfies this; do
+not substitute a cached older wheel. Install on both Pods (binaries
+committed, no Go toolchain):
 
 ```bash
 kubectl exec -n miles "$HEAD_POD" -- \
@@ -1352,6 +1357,24 @@ through it so the workers inherit them; a bare shell export on the head alone
 will not reach the actors. Section 23 covers the queue/exporter mechanics and
 recovery.
 
+**Per-sample metric rail (probe-research >= 0.22.0, optional but wanted for
+sample-level visibility):** miles' own `--custom-rollout-log-function-path`
+hook hands the raw per-sample list to a function inside the RolloutManager
+process; Probe ships a drop-in for it. Add ONE launch argument:
+
+```text
+--custom-rollout-log-function-path probe.connectors.miles.per_sample_rollout_log
+```
+
+Every rollout sample then streams `rollout/reward` and
+`rollout/response_length` through the same durable queue as label-identified
+points (`labels={"sample": <data-source sample index>, "group":
+<prompt-group index>}` — miles' global integer counters, point identity only,
+never a series axis). The hook is fail-open (a failure logs one warning and
+never reaches the rollout loop) and always returns False, so miles' default
+aggregate logging runs unchanged. Unconfigured (no `--use-probe`, no
+`PROBE_TOKEN`) it is a silent no-op — safe to leave in the launch template.
+
 Then use section 15 of `RUNPOD_E2E.md`, with:
 
 ```text
@@ -1629,7 +1652,19 @@ export PROBE_QUEUE_DIR=/workspace/probe/metrics
 The Probe SDK integration queues every Miles scalar with its existing step,
 event time, producer ID, and producer-local sequence before returning to
 training. The primary process creates or resumes the run, captures the launch
-snapshot and native IDs, and exports from the PVC in the background. API
+snapshot and native IDs, and exports from the PVC in the background.
+
+With the per-sample rail enabled (section 18), the RolloutManager process
+also enqueues one labeled point per sample per step on the same queue under
+its own producer identity; the single-lease exporter drains both rails in
+order. On the dashboard (research-os >= v0.35.2.0) these appear in a series'
+samples drawer, and a point whose sample id matches a captured Harbor trial
+carries a "trial" pill opening that trial's trajectory and sandbox-state view
+in place. For the pill to bind, the bridge/glue must stamp the SAME ids on
+the trial capture — pass `labels={"sample": <sample.index>, "group":
+<sample.group_index>}` (via `run.unit(...)` or the export correlation's
+`sample_id`); the reward point ↔ rollout span binding itself is automatic
+(the SDK logs the trial reward with the span's id as exemplar pointer). API
 initialization failures retain a complete run-creation intent; repair with
 `python -m miles.utils.tracking_utils.probe_utils <queue-directory>`.
 That command prints the resolved `run_id`. If bridge descriptors were created
@@ -1686,9 +1721,14 @@ Remaining instrumentation considerations:
    probe returned `Session not found` on `tools/list`; restart Claude Code so
    the plugin loads its `.mcp.json`, then verify the `research_*` tools from
    inside Claude. Continue using the SDK/CLI for writes.
-4. Metric points are append-only and dimensions are bounded labels. Log
-   per-rank/per-node metrics with dimensions rather than emitting thousands of
-   unique keys, and flush/finish the run even after a failed rollout.
+4. Metric points are append-only; dimensions are the bounded grouping axes
+   (<=8 keys) and labels the unbounded per-sample ids. Log per-rank/per-node
+   metrics with dimensions rather than emitting thousands of unique keys;
+   per-sample values go in labels (the per-sample rail does this for you) and
+   count against the run's labeled-point budget (`labeled_point_budget`,
+   default 2M — size it as num_rollout x rollout_batch_size x
+   n_samples_per_prompt x keys). Flush/finish the run even after a failed
+   rollout.
 5. Research OS artifact upload is content-addressed and remote, but large
    checkpoints and full filesystem trees should remain on the durable PVC;
    upload manifests, logs, trial bundles, and checksums rather than copying
