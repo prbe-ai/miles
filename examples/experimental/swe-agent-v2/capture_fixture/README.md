@@ -42,7 +42,7 @@ capture_fixture/
   Docker + `harbor` are present, so it runs on the agent-env host:
 
   ```bash
-  pip install -r ../requirements-public-harbor-capture.txt   # probe-research 0.9.1 + harbor
+  pip install -r ../requirements-public-harbor-capture.txt   # probe-research >= 0.23.0 + harbor
   pytest examples/experimental/swe-agent-v2/capture_fixture -m harbor
   ```
 
