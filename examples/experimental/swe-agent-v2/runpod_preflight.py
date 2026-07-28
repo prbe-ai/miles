@@ -48,8 +48,7 @@ def check_repo(report: Report, root: Path) -> None:
         "runpod guide": root / "examples/experimental/swe-agent-v2/RUNPOD_E2E.md",
         "public Harbor bridge": root / "examples/experimental/swe-agent-v2/public_harbor_server.py",
         "Runpod requirements": root / "examples/experimental/swe-agent-v2/requirements-runpod.txt",
-        "Runpod template environment example": root
-        / "examples/experimental/swe-agent-v2/runpod-template.env.example",
+        "Runpod template environment example": root / "examples/experimental/swe-agent-v2/runpod-template.env.example",
         "single-node launcher": root / "examples/experimental/swe-agent-v2/run.py",
         "async launcher": root / "examples/experimental/swe-agent-v2/run-glm47-flash-agentic-async.py",
     }
@@ -97,7 +96,9 @@ def check_repo(report: Report, root: Path) -> None:
         report.warnings.append("could not inspect git status")
         print("WARN: could not inspect git status")
     else:
-        report.warn(not status, "git worktree is clean", "git worktree has local changes; record them before deployment")
+        report.warn(
+            not status, "git worktree is clean", "git worktree has local changes; record them before deployment"
+        )
 
 
 def _required_env(report: Report, name: str) -> str:
@@ -164,7 +165,9 @@ def check_node(report: Report, args: argparse.Namespace) -> None:
     for command in ("git", "uv", "ray", "nvidia-smi", "curl", "rsync"):
         report.check(shutil.which(command) is not None, f"found {command}", f"required command is missing: {command}")
 
-    gpu_probe = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True) if shutil.which("nvidia-smi") else None
+    gpu_probe = (
+        subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True) if shutil.which("nvidia-smi") else None
+    )
     report.check(
         gpu_probe is not None and gpu_probe.returncode == 0 and "GPU " in gpu_probe.stdout,
         "NVIDIA GPUs are visible",
