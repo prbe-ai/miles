@@ -1,0 +1,6 @@
+-r requirements-public-harbor-server.txt
+harbor[modal]==0.18.0
+litellm==1.86.2
+# Match the minimum Modal SDK exercised by Harbor 0.18.0 instead of resolving a
+# future breaking minor release.
+modal==1.5.1

@@ -87,10 +87,7 @@ def find_bundles(root: str) -> list[str]:
     # silently reported as "no bundle").
     if os.path.basename(root.rstrip("/")) == BUNDLE_DIRNAME:
         return [root]
-    return sorted(
-        p for p in glob.glob(os.path.join(root, "**", BUNDLE_DIRNAME), recursive=True)
-        if os.path.isdir(p)
-    )
+    return sorted(p for p in glob.glob(os.path.join(root, "**", BUNDLE_DIRNAME), recursive=True) if os.path.isdir(p))
 
 
 def summarize(bundle_dir: str) -> str:

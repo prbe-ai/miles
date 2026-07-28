@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import enum
 import importlib.util
 import json
 import shutil
@@ -29,53 +31,136 @@ def _task_dir(tmp_path: Path) -> Path:
 
 
 def _install_fake_probe(monkeypatch):
-    """Install the SDK boundary double; SDK contract behavior is tested upstream."""
+    """Install the SDK boundary double for ``probe.connectors.harbor_capture``.
+
+    The facade's own contract (hook install, staging, fail-open, sandbox-state
+    recording) is tested upstream in the SDK (research-os-agent PR #99); these
+    tests only exercise what Miles still owns — the wiring into ``attach``/
+    ``finalize`` and the response mapping. Set ``seen["fail_finalize"] = True``
+    to mimic the SDK's never-raise staging failure (``status="failed"``).
+    """
     seen = {}
 
-    def stage_trial_export(trial_dir, destination, **kwargs):
-        seen.update({"trial_dir": Path(trial_dir), "destination": Path(destination), **kwargs})
-        root = Path(destination)
-        staged_trial = root / "trial"
-        root.mkdir(parents=True)
-        shutil.copytree(trial_dir, staged_trial, symlinks=True)
-        files = [
-            {"path": str(path.relative_to(staged_trial)), "size_bytes": path.stat().st_size}
-            for path in staged_trial.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        ]
-        manifest_path = root / "capture-manifest.json"
-        manifest_path.write_text(
-            json.dumps(
+    @dataclasses.dataclass
+    class SandboxStateOptions:
+        begin_timeout_sec: float = 120.0
+        end_timeout_sec: float = 300.0
+        hash_files: bool = False
+        exclude: tuple = ()
+        max_files: int | None = None
+        max_delta_bytes: int | None = None
+
+    class FakeHandle:
+        def __init__(self, trial, *, correlation, context, capture_mode, sandbox_state):
+            self._trial = trial
+            self.correlation = correlation
+            self.context = context
+            self.capture_mode = capture_mode
+            self.sandbox_state = sandbox_state
+            self.errors = []
+            self._sandbox_id = None
+            self._provider_sandbox_id = None
+            from harbor.trial.hooks import TrialEvent
+
+            trial.add_hook(TrialEvent.AGENT_START, self._capture)
+            trial.add_hook(TrialEvent.AGENT_END, self._capture)
+
+        async def _capture(self, _event=None):
+            environment = getattr(self._trial, "agent_environment", None)
+            self._sandbox_id = getattr(environment, "session_id", None) or self._sandbox_id
+            handle = getattr(environment, "_sandbox", None)
+            if handle is not None:
+                self._provider_sandbox_id = getattr(handle, "object_id", None) or self._provider_sandbox_id
+
+        @property
+        def sandbox_ids(self):
+            return (self._sandbox_id, self._provider_sandbox_id)
+
+        async def finalize(
+            self,
+            trial_dir,
+            *,
+            capture_dir=None,
+            run_id=None,
+            step_index=None,
+            environment=None,
+            external_key=None,
+            create_archive=True,
+        ):
+            seen.update(
                 {
-                    "files": files,
-                    "capture": {
-                        "completeness": {"status": "complete"},
-                        "archive": {"content_hash": "a" * 64},
-                    },
+                    "finalize_trial_dir": Path(trial_dir),
+                    "finalize_capture_dir": Path(capture_dir) if capture_dir is not None else None,
+                    "run_id": run_id,
+                    "step_index": step_index,
+                    "environment": environment,
                 }
             )
+            summary = self.sandbox_state.summary() if self.sandbox_state is not None else None
+            if seen.get("fail_finalize"):
+                return SimpleNamespace(
+                    status="failed",
+                    staged_trial_dir=None,
+                    archive_path=None,
+                    manifest_path=None,
+                    export_descriptor_path=None,
+                    archive_content_hash=None,
+                    external_key=None,
+                    file_count=0,
+                    size_bytes=0,
+                    sandbox_id=self._sandbox_id,
+                    provider_sandbox_id=self._provider_sandbox_id,
+                    sandbox_state=summary,
+                    error="RuntimeError: capture unavailable",
+                )
+            root = Path(capture_dir) / "staged"
+            staged_trial = root / "trial"
+            shutil.copytree(trial_dir, staged_trial, symlinks=True)
+            files = [path for path in staged_trial.rglob("*") if path.is_file() and not path.is_symlink()]
+            return SimpleNamespace(
+                status="complete",
+                staged_trial_dir=str(staged_trial),
+                archive_path=str(root / "trial.tar.gz"),
+                manifest_path=str(root / "capture-manifest.json"),
+                export_descriptor_path=str(root / "export-request.json"),
+                archive_content_hash="a" * 64,
+                external_key="probe:v1:harbor:rollout:test",
+                file_count=len(files),
+                size_bytes=sum(path.stat().st_size for path in files),
+                sandbox_id=self._sandbox_id,
+                provider_sandbox_id=self._provider_sandbox_id,
+                sandbox_state=summary,
+                error=None,
+            )
+
+    def attach(trial, *, correlation=None, context=None, capture_mode="shadow", sandbox_state=None):
+        seen.update(
+            {
+                "attach_correlation": dict(correlation or {}),
+                "attach_context": dict(context or {}),
+                "capture_mode": capture_mode,
+                "sandbox_state_options": sandbox_state,
+            }
         )
-        request_path = root / "export-request.json"
-        external_key = "probe:v1:harbor:rollout:test"
-        descriptor = {"correlation": {"external_key": external_key}}
-        request_path.write_text(json.dumps(descriptor))
-        archive_path = root / "trial.tar.gz"
-        archive_path.write_bytes(b"recovery")
-        return SimpleNamespace(
-            staged_trial=SimpleNamespace(trial_dir=staged_trial),
-            capture_manifest_path=manifest_path,
-            request_path=request_path,
-            descriptor=descriptor,
-            archive_path=archive_path,
+        return FakeHandle(
+            trial,
+            correlation=dict(correlation or {}),
+            context=dict(context or {}),
+            capture_mode=capture_mode,
+            sandbox_state=sandbox_state,
         )
 
     probe_module = ModuleType("probe")
     connectors_module = ModuleType("probe.connectors")
-    harbor_module = ModuleType("probe.connectors.harbor")
-    harbor_module.stage_trial_export = stage_trial_export
+    harbor_capture_module = ModuleType("probe.connectors.harbor_capture")
+    harbor_capture_module.attach = attach
+    harbor_capture_module.CAPTURE_MODES = frozenset({"off", "shadow", "required"})
+    harbor_runner_module = ModuleType("probe.connectors.harbor_runner")
+    harbor_runner_module.SandboxStateOptions = SandboxStateOptions
     monkeypatch.setitem(sys.modules, "probe", probe_module)
     monkeypatch.setitem(sys.modules, "probe.connectors", connectors_module)
-    monkeypatch.setitem(sys.modules, "probe.connectors.harbor", harbor_module)
+    monkeypatch.setitem(sys.modules, "probe.connectors.harbor_capture", harbor_capture_module)
+    monkeypatch.setitem(sys.modules, "probe.connectors.harbor_runner", harbor_runner_module)
     return seen
 
 
@@ -169,92 +254,14 @@ def test_normalize_trial_result() -> None:
     assert response.agent_metrics["agent_run_time"] == 2.0
 
 
-def test_stage_trial_capture_delegates_native_values_to_probe_sdk(tmp_path: Path, monkeypatch) -> None:
-    seen = _install_fake_probe(monkeypatch)
-    trial_dir = tmp_path / "trials" / "task__abc"
-    (trial_dir / "agent" / "commands").mkdir(parents=True)
-    (trial_dir / "verifier").mkdir()
-    (trial_dir / "unknown").mkdir()
-    (trial_dir / "config.json").write_text(json.dumps({"task": {"name": "task"}}))
-    (trial_dir / "lock.json").write_text(json.dumps({"task": {"checksum": "sha256:task"}}))
-    (trial_dir / "result.json").write_text(
-        json.dumps(
-            {
-                "id": "harbor-result-id",
-                "trial_name": "task__abc",
-                "task_name": "task",
-                "task_checksum": "sha256:task",
-                "agent_info": {"name": "custom-agent", "version": "1"},
-                "verifier_result": {"rewards": {"reward": 0.75, "tests": 1.0}},
-                "agent_execution": {"started_at": "2026-07-22T01:00:00Z", "finished_at": "2026-07-22T01:01:00Z"},
-            }
-        )
-    )
-    (trial_dir / "agent" / "commands" / "stdout.log").write_text("agent output\n")
-    (trial_dir / "verifier" / "reward.json").write_text('{"reward": 0.75}\n')
-    native_bytes = b"\x00\xffprivate-fork-data"
-    (trial_dir / "unknown" / "native.bin").write_bytes(native_bytes)
-    (trial_dir / ".native-state").write_text("preserved in archive")
-    (trial_dir / "latest-result").symlink_to("result.json")
-
-    request = server.RunRequest(
-        base_url="http://miles.internal:30000/sessions/session-123/v1",
-        model="openai/model",
-        instance_id="task",
-        run_id="probe-run-1",
-        miles_run_id="miles-run-1",
-        rollout_id=17,
-        sample_id=41,
-        group_id=9,
-        capture_context={"mix": "swe-and-terminal"},
-    )
-    capture = server.stage_trial_capture(
-        trial_dir,
-        tmp_path / "durable-captures",
-        trial_id="trial-uuid",
-        task_id="task",
-        environment_type="daytona",
-        delete_requested=True,
-        sandbox_id="task__abc__env",
-        provider_sandbox_id="daytona-123",
-        session_id="session-123",
-        request=request,
-    )
-
-    assert capture.status == "complete"
-    staged_trial = Path(capture.staged_trial_dir)
-    assert (staged_trial / "unknown" / "native.bin").read_bytes() == native_bytes
-    assert (staged_trial / "latest-result").is_symlink()
-
-    assert seen["run_id"] == "probe-run-1"
-    assert seen["step_index"] == 17
-    assert seen["correlation"] == {
-        "miles_run_id": "miles-run-1",
-        "rollout_id": 17,
-        "sample_id": 41,
-        "group_id": 9,
-        "session_id": "session-123",
-        "trial_id": "trial-uuid",
-        "task_id": "task",
-    }
-    assert seen["context"] == {"mix": "swe-and-terminal"}
-    assert seen["environment"]["collected"] == {
-        "native_trial_directory": True,
-        "staged_after_trial_run_returned": True,
-    }
-
-
-def test_capture_directory_name_cannot_escape_or_collapse_provider_ids() -> None:
-    first = server._capture_directory_name("../provider/id")
-    second = server._capture_directory_name(".._provider_id")
-    assert "/" not in first and first not in {".", ".."}
-    assert first != second
-
-
 @pytest.mark.asyncio
 async def test_trial_response_carries_correlation_and_completed_capture(tmp_path: Path, monkeypatch) -> None:
-    _install_fake_probe(monkeypatch)
+    seen = _install_fake_probe(monkeypatch)
     task_dir = _task_dir(tmp_path)
+
+    class FakeTrialEvent(enum.Enum):
+        AGENT_START = "agent-start"
+        AGENT_END = "agent-end"
 
     class Config:
         def __init__(self, **kwargs):
@@ -272,14 +279,23 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
             self.paths = SimpleNamespace(trial_dir=config.trials_dir / config.trial_name)
             self.agent_environment = SimpleNamespace(
                 session_id=f"{config.trial_name}__env",
-                _sandbox=SimpleNamespace(id="provider-sandbox-id"),
+                _sandbox=SimpleNamespace(object_id="provider-sandbox-id"),
             )
+            self.hooks = {event: [] for event in FakeTrialEvent}
 
         @classmethod
         async def create(cls, config):
             return cls(config)
 
+        def add_hook(self, event, hook):
+            self.hooks[event].append(hook)
+
+        async def emit(self, event):
+            for hook in self.hooks[event]:
+                await hook(SimpleNamespace(event=event))
+
         async def run(self):
+            await self.emit(FakeTrialEvent.AGENT_START)
             self.paths.trial_dir.mkdir(parents=True)
             (self.paths.trial_dir / "agent").mkdir()
             (self.paths.trial_dir / "agent" / "native.log").write_text("native agent log")
@@ -292,13 +308,16 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
                 "verifier_result": {"rewards": {"reward": 1.0}},
             }
             (self.paths.trial_dir / "result.json").write_text(json.dumps(result_doc))
-            return SimpleNamespace(
+            result = SimpleNamespace(
                 verifier_result=SimpleNamespace(rewards={"reward": 1.0}),
                 exception_info=None,
                 agent_result=None,
                 agent_execution=None,
                 verifier=None,
             )
+            await self.emit(FakeTrialEvent.AGENT_END)
+            self.agent_environment._sandbox = None
+            return result
 
     for package in ("harbor", "harbor.models", "harbor.models.trial", "harbor.trial"):
         module = ModuleType(package)
@@ -313,6 +332,9 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     trial_module = ModuleType("harbor.trial.trial")
     trial_module.Trial = FakeTrial
     monkeypatch.setitem(sys.modules, "harbor.trial.trial", trial_module)
+    hooks_module = ModuleType("harbor.trial.hooks")
+    hooks_module.TrialEvent = FakeTrialEvent
+    monkeypatch.setitem(sys.modules, "harbor.trial.hooks", hooks_module)
 
     settings = server.Settings(
         tasks_dir=task_dir.parent,
@@ -329,6 +351,7 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
         rollout_id=3,
         sample_id=4,
         group_id=5,
+        capture_context={"mix": "swe-and-terminal"},
     )
     response = await server.run_public_harbor_trial(request, settings)
 
@@ -348,10 +371,26 @@ async def test_trial_response_carries_correlation_and_completed_capture(tmp_path
     assert response.capture.status == "complete"
     assert Path(response.capture.staged_trial_dir, "agent", "native.log").read_text() == "native agent log"
 
-    def fail_if_staged(*args, **kwargs):
-        raise RuntimeError("capture unavailable")
+    # Miles-owned wiring into the SDK facade: correlation/context at attach,
+    # run/step/capture-dir/environment at finalize.
+    assert seen["capture_mode"] == "shadow"
+    assert seen["sandbox_state_options"] is None
+    assert seen["attach_correlation"] == {
+        "miles_run_id": "miles-unit",
+        "rollout_id": 3,
+        "sample_id": 4,
+        "group_id": 5,
+        "session_id": "session-unit",
+        "trial_id": "trial-unit-id",
+        "task_id": "hello-world",
+    }
+    assert seen["attach_context"] == {"mix": "swe-and-terminal"}
+    assert seen["run_id"] == "run-unit"
+    assert seen["step_index"] == 3
+    assert seen["finalize_capture_dir"] == settings.capture_dir
+    assert seen["environment"] == {"type": "docker", "delete_requested": True}
 
-    monkeypatch.setattr(server, "stage_trial_capture", fail_if_staged)
+    seen["fail_finalize"] = True
     off_capture_dir = tmp_path / "off-captures"
     off_response = await server.run_public_harbor_trial(
         request,

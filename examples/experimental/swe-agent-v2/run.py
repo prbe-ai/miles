@@ -163,7 +163,7 @@ def execute(args: ScriptArgs):
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
-        "--sglang-mem-fraction-static 0.7 "
+        "--sglang-mem-fraction-static 0.80 "
         "--sglang-tool-call-parser glm47 "
         "--sglang-reasoning-parser glm45 "
         "--use-miles-router "
@@ -238,6 +238,7 @@ def execute(args: ScriptArgs):
 
     extra_env_vars = {
         "PYTHONPATH": f"{args.megatron_path}:{SCRIPT_DIR}:{miles_root}",
+        "TRITON_CACHE_DIR": f"/tmp/miles-triton-cache/{args.run_id}",
         "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
         "AGENT_SERVER_URL": args.agent_server_url,
         "AGENT_MODEL_NAME": args.agent_model_name,
