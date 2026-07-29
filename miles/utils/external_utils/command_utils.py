@@ -22,6 +22,8 @@ repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
 
 def collect_probe_runtime_env() -> dict[str, str]:
     """Carry configured Probe tracking into the submitted Ray job."""
+    if os.environ.get("MILES_USE_PROBE", "").lower() not in {"1", "true"}:
+        return {}
     return {
         key: value
         for key, value in os.environ.items()

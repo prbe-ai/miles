@@ -59,3 +59,11 @@ def test_collect_probe_runtime_env(monkeypatch):
         "PROBE_TOKEN": "probe-secret",
         "PROBE_PROJECT": "miles-nebius",
     }
+
+
+def test_collect_probe_runtime_env_is_empty_when_tracking_is_disabled(monkeypatch):
+    monkeypatch.delenv("MILES_USE_PROBE", raising=False)
+    monkeypatch.setenv("PROBE_TOKEN", "probe-secret")
+    monkeypatch.setenv("PROBE_PROJECT", "miles-nebius")
+
+    assert command_utils.collect_probe_runtime_env() == {}

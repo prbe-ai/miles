@@ -1313,11 +1313,12 @@ export MILES_ROUTER_EXTERNAL_BASE_URL=https://miles-model.example.com
 unset MILES_ROUTER_EXTERNAL_HOST
 ```
 
-Run section 13 of `RUNPOD_E2E.md` for exactly one colocated
-`debug_rollout_only` trial, with these changes:
+Run section 13 of `RUNPOD_E2E.md` for exactly two colocated
+`debug_rollout_only` trials, with these changes:
 
 - use `--session-server-port 30000`;
 - keep `--session-server-bind-ip 0.0.0.0`;
+- use `--rollout-batch-size 1` and `--n-samples-per-prompt 2`;
 - use `--global-batch-size 2` (TP=4 on eight GPUs gives DP=2);
 - do not pass `--miles-host-ip`; Kubernetes/Pod networking should determine
   each process's routable address;
