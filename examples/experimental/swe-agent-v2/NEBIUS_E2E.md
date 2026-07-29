@@ -1453,6 +1453,22 @@ Megatron also required the global batch size to be divisible by microbatch size
 times data-parallel size. In the observed DP=2 layout, `global_batch_size=1`
 failed validation; changing it to 2 exposed the subsequent gradient-buffer OOM.
 
+Before paying for another online sandbox batch, replay a verified two-sample
+debug rollout through the real training stack:
+
+```text
+--mode debug_train_only
+--load-debug-rollout-data <section-17-or-18-traces>/rollout_data/{rollout_id}.pt
+--num-rollout 1
+--global-batch-size 2
+```
+
+The async launcher retains `--grad-reduce-in-bf16` for this gate. Require
+optimizer step 0, a trace, a checkpoint, idle GPUs afterward, and a completed
+Probe run with readable production metrics. This isolates training-memory and
+checkpoint correctness from callback/TLS and sandbox cost; it does not replace
+the final online normal-mode gate.
+
 ## 19. Failure decisions
 
 | Symptom | Action |

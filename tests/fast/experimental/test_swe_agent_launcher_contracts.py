@@ -40,3 +40,12 @@ def test_launchers_expose_probe_per_sample_hook():
 def test_async_debug_launcher_preserves_disaggregated_topology():
     source = (LAUNCHER_DIR / "run-glm47-flash-agentic-async.py").read_text()
     assert "--debug-rollout-only --debug-rollout-only-disaggregated " in source
+
+
+def test_async_launcher_exposes_bounded_training_replay():
+    path = LAUNCHER_DIR / "run-glm47-flash-agentic-async.py"
+    source = path.read_text()
+    assert "load_debug_rollout_data" in _script_args_fields(path)
+    assert 'f"--load-debug-rollout-data {args.load_debug_rollout_data} "' in source
+    assert '"debug_train_only"' in source
+    assert "--debug-train-only " in source

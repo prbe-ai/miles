@@ -44,7 +44,7 @@ MAX_CONVERT_GPUS = 92
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    mode: Literal["normal", "debug_rollout_only"] = "normal"
+    mode: Literal["normal", "debug_rollout_only", "debug_train_only"] = "normal"
     run_id: str = U.create_run_id()
     megatron_model_type: str = "glm4.7-flash"
     num_gpus_per_node: int = 8
@@ -59,6 +59,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Directory to dump rollout + training traces (per-rollout .pt files). Empty
     # means default to ``<save_dir>/traces``; set to ``"disabled"`` to skip.
     save_traces_dir: str = ""
+    load_debug_rollout_data: str = ""
     prompt_data: str = "/root/swe_train.jsonl"
     max_seq_len: int = 16384
     rollout_max_response_len: int = 8192
@@ -188,6 +189,8 @@ def execute(args: ScriptArgs):
         "--balance-data "
         f"--pause-generation-mode {args.pause_generation_mode} "
     )
+    if args.load_debug_rollout_data:
+        rollout_args += f"--load-debug-rollout-data {args.load_debug_rollout_data} "
     if args.custom_rollout_log_function_path:
         rollout_args += (
             "--custom-rollout-log-function-path "
@@ -331,11 +334,14 @@ def execute(args: ScriptArgs):
     if traces_dir != "disabled":
         misc_args += f"--dump-details {traces_dir} "
 
-    debug_args = (
-        "--debug-rollout-only --debug-rollout-only-disaggregated "
-        if args.mode == "debug_rollout_only"
-        else ""
-    )
+    if args.mode == "debug_rollout_only":
+        debug_args = "--debug-rollout-only --debug-rollout-only-disaggregated "
+    elif args.mode == "debug_train_only":
+        if not args.load_debug_rollout_data:
+            raise ValueError("debug_train_only requires --load-debug-rollout-data")
+        debug_args = "--debug-train-only "
+    else:
+        debug_args = ""
 
     wandb_args = ""
     if args.wandb_key:
