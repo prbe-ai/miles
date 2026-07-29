@@ -104,6 +104,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 8192
     optimizer_cpu_offload: bool = True
     use_precision_aware_optimizer: bool = True
+    tensor_model_parallel_size: int = 4
+    pipeline_model_parallel_size: int = 1
+    decoder_last_pipeline_num_layers: int | None = None
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int | None = None
+    expert_tensor_parallel_size: int = 1
 
     # W&B settings
     wandb_key: str = field(
@@ -212,27 +218,48 @@ def execute(args: ScriptArgs):
         f"{rollout_num_nodes} nodes ({rollout_gpus} GPUs) inference"
     )
 
-    # Training parallelism for Flash: TP=4 (divides 20-head attention), PP=1,
-    # EP = largest divisor of 64 that also divides DP.
-    tp, pp = 4, 1
-    dp = train_gpus // (tp * pp)
-    assert train_gpus % (tp * pp) == 0, f"train GPUs ({train_gpus}) must be divisible by TP*PP ({tp * pp})"
+    # Flash has 20 attention heads, so TP must divide 20. Keep the legacy
+    # TP=4/PP=1 defaults, but expose the full training topology so 80-GiB H100
+    # runs can use Miles' checked-in TP=2/PP=2/CP=2/EP=4 layout.
+    tp = args.tensor_model_parallel_size
+    pp = args.pipeline_model_parallel_size
+    cp = args.context_parallel_size
+    etp = args.expert_tensor_parallel_size
+    model_parallel_size = tp * pp * cp
+    assert 20 % tp == 0, f"GLM-4.7-Flash attention heads (20) must be divisible by TP ({tp})"
+    assert train_gpus % model_parallel_size == 0, (
+        f"train GPUs ({train_gpus}) must be divisible by TP*PP*CP "
+        f"({tp}*{pp}*{cp}={model_parallel_size})"
+    )
+    dp = train_gpus // model_parallel_size
     num_experts = 64
-    ep = max(d for d in range(1, dp + 1) if num_experts % d == 0 and dp % d == 0)
+    ep = args.expert_model_parallel_size
+    if ep is None:
+        ep = max(d for d in range(1, dp + 1) if num_experts % d == 0 and dp % d == 0)
+    assert num_experts % ep == 0, f"experts ({num_experts}) must be divisible by EP ({ep})"
+    assert train_gpus % (etp * ep * pp) == 0, (
+        f"train GPUs ({train_gpus}) must be divisible by ETP*EP*PP "
+        f"({etp}*{ep}*{pp}={etp * ep * pp})"
+    )
 
     perf_args = (
         f"--tensor-model-parallel-size {tp} "
         "--sequence-parallel "
         f"--pipeline-model-parallel-size {pp} "
-        "--context-parallel-size 1 "
+        f"--context-parallel-size {cp} "
         f"--expert-model-parallel-size {ep} "
-        "--expert-tensor-parallel-size 1 "
+        f"--expert-tensor-parallel-size {etp} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         "--use-dynamic-batch-size "
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} "
     )
+    if args.decoder_last_pipeline_num_layers is not None:
+        perf_args += (
+            f"--decoder-last-pipeline-num-layers "
+            f"{args.decoder_last_pipeline_num_layers} "
+        )
     if args.optimizer_cpu_offload:
         perf_args += "--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
     if args.use_precision_aware_optimizer:

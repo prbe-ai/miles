@@ -49,3 +49,24 @@ def test_async_launcher_exposes_bounded_training_replay():
     assert 'f"--load-debug-rollout-data {args.load_debug_rollout_data} "' in source
     assert '"debug_train_only"' in source
     assert "--debug-train-only " in source
+
+
+def test_async_launcher_exposes_h100_training_parallelism():
+    path = LAUNCHER_DIR / "run-glm47-flash-agentic-async.py"
+    source = path.read_text()
+    fields = _script_args_fields(path)
+
+    assert {
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "decoder_last_pipeline_num_layers",
+        "context_parallel_size",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+    } <= fields
+    assert "GLM-4.7-Flash attention heads (20) must be divisible by TP" in source
+    assert 'f"--tensor-model-parallel-size {tp} "' in source
+    assert 'f"--pipeline-model-parallel-size {pp} "' in source
+    assert "--decoder-last-pipeline-num-layers " in source
+    assert 'f"--context-parallel-size {cp} "' in source
+    assert 'f"--expert-model-parallel-size {ep} "' in source

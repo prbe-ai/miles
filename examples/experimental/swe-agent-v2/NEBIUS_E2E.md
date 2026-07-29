@@ -1442,8 +1442,8 @@ the Pods had the intended 120 CPUs, 1400 GiB RAM, and eight H100s. It was a
 model-parallel layout that did not fit in 80 GiB per training GPU. Before
 retrying a policy update, validate one of these changes in isolation:
 
-- increase training tensor parallelism from 4 to 8 and adjust expert/data
-  parallelism so the world-size and batch divisibility constraints still hold;
+- use the checked-in H100 GLM-4.7-Flash layout (TP=2, PP=2 with 23 decoder
+  layers on the last stage, CP=2, EP=4, ETP=1);
 - reduce model, sequence, microbatch, or retained activation requirements;
 - use a memory-reducing distributed strategy whose checkpoint conversion is
   compatible with this model; or
@@ -1461,13 +1461,23 @@ debug rollout through the real training stack:
 --load-debug-rollout-data <section-17-or-18-traces>/rollout_data/{rollout_id}.pt
 --num-rollout 1
 --global-batch-size 2
+--tensor-model-parallel-size 2
+--pipeline-model-parallel-size 2
+--decoder-last-pipeline-num-layers 23
+--context-parallel-size 2
+--expert-model-parallel-size 4
+--expert-tensor-parallel-size 1
 ```
 
-The async launcher retains `--grad-reduce-in-bf16` for this gate. Require
-optimizer step 0, a trace, a checkpoint, idle GPUs afterward, and a completed
-Probe run with readable production metrics. This isolates training-memory and
-checkpoint correctness from callback/TLS and sandbox cost; it does not replace
-the final online normal-mode gate.
+The H100 layout above matches Miles' checked-in GLM-4.7-Flash H100 E2E
+coverage. Its 24/23 pipeline split reduces per-rank model and DDP buffer
+pressure; do not use the launcher's legacy TP=4, PP=1 defaults for this
+80-GiB memory gate. The async launcher also retains
+`--grad-reduce-in-bf16`. Require optimizer step 0, a trace, a checkpoint,
+idle GPUs afterward, and a completed Probe run with readable production
+metrics. This isolates training-memory and checkpoint correctness from
+callback/TLS and sandbox cost; it does not replace the final online
+normal-mode gate.
 
 ## 19. Failure decisions
 
