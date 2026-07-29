@@ -1324,7 +1324,10 @@ Run section 13 of `RUNPOD_E2E.md` for exactly two colocated
   each process's routable address;
 - use the external host for direct smoke or full external base URL for relay.
 
-Then run section 14's fully async two-node debug command with the same changes.
+Then run section 14's fully async two-node debug command with the same changes,
+plus `--over-sampling-batch-size 2`. The async launcher's debug mode retains
+separate eight-GPU actor and rollout placement pools so Ray must place one pool
+on each node; stop if its placement log puts all bundles on one node.
 The gate succeeds only when:
 
 - RolloutManager/session server is in the head Pod selected by

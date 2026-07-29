@@ -331,7 +331,11 @@ def execute(args: ScriptArgs):
     if traces_dir != "disabled":
         misc_args += f"--dump-details {traces_dir} "
 
-    debug_args = "--debug-rollout-only " if args.mode == "debug_rollout_only" else ""
+    debug_args = (
+        "--debug-rollout-only --debug-rollout-only-disaggregated "
+        if args.mode == "debug_rollout_only"
+        else ""
+    )
 
     wandb_args = ""
     if args.wandb_key:

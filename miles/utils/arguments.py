@@ -1762,6 +1762,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--debug-rollout-only-disaggregated",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep separate actor and rollout placement-group bundles in "
+                    "debug-rollout-only mode so a disaggregated topology can be validated."
+                ),
+            )
+            parser.add_argument(
                 "--debug-train-only",
                 action="store_true",
                 default=False,
@@ -2784,7 +2793,11 @@ def miles_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
+        if args.debug_rollout_only_disaggregated:
+            assert not args.colocate, (
+                "--debug-rollout-only-disaggregated requires separate actor and rollout GPU pools"
+            )
+        elif args.colocate and (not args.rollout_num_gpus):
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
         else:
             args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
@@ -2797,6 +2810,9 @@ def miles_validate_args(args):
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
+    )
+    assert not args.debug_rollout_only_disaggregated or args.debug_rollout_only, (
+        "--debug-rollout-only-disaggregated requires --debug-rollout-only"
     )
 
     if args.ci_test and not args.debug_rollout_only and not args.debug_train_only:

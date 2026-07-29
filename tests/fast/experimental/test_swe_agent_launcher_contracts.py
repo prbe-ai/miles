@@ -35,3 +35,8 @@ def test_launchers_expose_probe_per_sample_hook():
         assert "custom_rollout_log_function_path" in _script_args_fields(path)
         assert "--custom-rollout-log-function-path " in source
         assert "collect_probe_runtime_env()" in source
+
+
+def test_async_debug_launcher_preserves_disaggregated_topology():
+    source = (LAUNCHER_DIR / "run-glm47-flash-agentic-async.py").read_text()
+    assert "--debug-rollout-only --debug-rollout-only-disaggregated " in source

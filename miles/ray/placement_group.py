@@ -98,8 +98,12 @@ def create_placement_groups(args):
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
     elif args.debug_rollout_only:
-        num_gpus = args.rollout_num_gpus
-        rollout_offset = 0
+        if getattr(args, "debug_rollout_only_disaggregated", False):
+            num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
+            rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+        else:
+            num_gpus = args.rollout_num_gpus
+            rollout_offset = 0
     elif args.colocate:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
