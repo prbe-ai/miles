@@ -1318,6 +1318,7 @@ Run section 13 of `RUNPOD_E2E.md` for exactly one colocated
 
 - use `--session-server-port 30000`;
 - keep `--session-server-bind-ip 0.0.0.0`;
+- use `--global-batch-size 2` (TP=4 on eight GPUs gives DP=2);
 - do not pass `--miles-host-ip`; Kubernetes/Pod networking should determine
   each process's routable address;
 - use the external host for direct smoke or full external base URL for relay.

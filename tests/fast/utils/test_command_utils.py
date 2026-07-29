@@ -44,3 +44,18 @@ def test_execute_train_preserves_source_paths_in_ray_runtime(monkeypatch):
     expected = os.pathsep.join([str(command_utils.repo_base_dir), "/megatron", "/custom", "/sglang", "/existing"])
     assert runtime_env["env_vars"]["PYTHONPATH"] == expected
     assert runtime_env["env_vars"]["QUOTED_VALUE"] == "it's preserved"
+
+
+def test_collect_probe_runtime_env(monkeypatch):
+    monkeypatch.setenv("MILES_USE_PROBE", "1")
+    monkeypatch.setenv("MILES_RUN_ID", "stable-id")
+    monkeypatch.setenv("PROBE_TOKEN", "probe-secret")
+    monkeypatch.setenv("PROBE_PROJECT", "miles-nebius")
+    monkeypatch.setenv("UNRELATED_VALUE", "ignored")
+
+    assert command_utils.collect_probe_runtime_env() == {
+        "MILES_USE_PROBE": "1",
+        "MILES_RUN_ID": "stable-id",
+        "PROBE_TOKEN": "probe-secret",
+        "PROBE_PROJECT": "miles-nebius",
+    }

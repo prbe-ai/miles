@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Sequence
@@ -108,8 +109,35 @@ class SingletonMeta(type):
         SingletonMeta._instances.clear()
 
 
+_SENSITIVE_ENV_NAME = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)$", re.IGNORECASE)
+_SENSITIVE_JSON_VALUE = re.compile(
+    r'("(?P<key>[^"]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY))"\s*:\s*")[^"]*(")',
+    re.IGNORECASE,
+)
+_SENSITIVE_CLI_VALUE = re.compile(
+    r"(?P<prefix>--(?:wandb-key|agent-server-auth-token)\s+)(?P<quote>['\"]?)[^'\"\s]+(?P=quote)",
+    re.IGNORECASE,
+)
+
+
+def _redact_command_for_logging(cmd: str) -> str:
+    redacted = cmd
+    for name, value in os.environ.items():
+        if len(value) >= 4 and _SENSITIVE_ENV_NAME.search(name):
+            redacted = redacted.replace(value, f"<redacted:{name}>")
+    redacted = _SENSITIVE_JSON_VALUE.sub(
+        lambda match: f'{match.group(1)}<redacted:{match.group("key")}>{match.group(3)}',
+        redacted,
+    )
+    redacted = _SENSITIVE_CLI_VALUE.sub(
+        lambda match: f'{match.group("prefix")}<redacted>',
+        redacted,
+    )
+    return redacted
+
+
 def exec_command(cmd: str, capture_output: bool = False) -> str | None:
-    print(f"EXEC: {cmd}", flush=True)
+    print(f"EXEC: {_redact_command_for_logging(cmd)}", flush=True)
 
     try:
         result = subprocess.run(

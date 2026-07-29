@@ -70,6 +70,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     n_samples_per_prompt: int = 4
     global_batch_size: int = 32
     over_sampling_batch_size: int = 64
+    custom_rollout_log_function_path: str = os.environ.get(
+        "MILES_CUSTOM_ROLLOUT_LOG_FUNCTION_PATH", ""
+    )
 
     # Rollout precision
     rollout_fp8: bool = False
@@ -179,6 +182,11 @@ def execute(args: ScriptArgs):
         "--balance-data "
         f"--pause-generation-mode {args.pause_generation_mode} "
     )
+    if args.custom_rollout_log_function_path:
+        rollout_args += (
+            "--custom-rollout-log-function-path "
+            f"{args.custom_rollout_log_function_path} "
+        )
 
     eval_args = ""
 
@@ -367,6 +375,7 @@ def execute(args: ScriptArgs):
         "AGENT_SERVER_AUTH_TOKEN": args.agent_server_auth_token,
         "AGENT_SERVER_TIMEOUT_SEC": str(args.agent_server_timeout_sec),
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
+        **U.collect_probe_runtime_env(),
         **sglang_extra_env_vars,
     }
     if args.router_external_host:

@@ -42,9 +42,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     # Training settings
     max_seq_len: int = 16384
+    rollout_max_response_len: int = 8192
+    num_rollout: int = 3000
     rollout_batch_size: int = 2
     n_samples_per_prompt: int = 4
     global_batch_size: int = 8
+    custom_rollout_log_function_path: str = os.environ.get(
+        "MILES_CUSTOM_ROLLOUT_LOG_FUNCTION_PATH", ""
+    )
 
     # Agent settings
     agent_server_url: str = os.environ.get(
@@ -115,15 +120,20 @@ def execute(args: ScriptArgs):
         "--input-key prompt "
         "--metadata-key metadata "
         "--rollout-shuffle "
-        "--num-rollout 3000 "
+        f"--num-rollout {args.num_rollout} "
         f"--rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
         "--rollout-temperature 0.8 "
-        "--rollout-max-response-len 8192 "
+        f"--rollout-max-response-len {args.rollout_max_response_len} "
         f"--max-seq-len {args.max_seq_len} "
         f"--global-batch-size {args.global_batch_size} "
         "--balance-data "
     )
+    if args.custom_rollout_log_function_path:
+        rollout_args += (
+            "--custom-rollout-log-function-path "
+            f"{args.custom_rollout_log_function_path} "
+        )
 
     perf_args = (
         "--tensor-model-parallel-size 4 "
@@ -247,6 +257,7 @@ def execute(args: ScriptArgs):
         "MILES_ROUTER_EXTERNAL_HOST": args.router_external_host,
         "HARBOR_TASKS_DIR": args.harbor_tasks_dir,
         "MILES_HOST_IP": args.miles_host_ip,
+        **U.collect_probe_runtime_env(),
     }
     if args.router_external_base_url:
         extra_env_vars["MILES_ROUTER_EXTERNAL_BASE_URL"] = args.router_external_base_url

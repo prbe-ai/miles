@@ -861,7 +861,7 @@ python examples/experimental/swe-agent-v2/run.py \
   --num-rollout 1 \
   --rollout-batch-size 1 \
   --n-samples-per-prompt 1 \
-  --global-batch-size 1 \
+  --global-batch-size 2 \
   --max-seq-len 16384 \
   --rollout-max-response-len 8192 \
   --agent-server-url "$AGENT_SERVER_URL" \
@@ -872,6 +872,10 @@ python examples/experimental/swe-agent-v2/run.py \
   "${CALLBACK_ARGS[@]}" \
   --miles-host-ip "$PRIMARY_ADDR"
 ```
+
+The launcher exposes `--num-rollout` and `--rollout-max-response-len`; keep
+both explicit for this bounded gate. With TP=4 on eight H100s, Megatron derives
+DP=2, so global batch size 2 is the smallest valid value.
 
 The callback argument array selects the full relay origin when set and
 otherwise uses the direct callback host. Do not set both callback variables

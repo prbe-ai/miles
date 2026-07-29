@@ -20,6 +20,15 @@ _ = exec_command, exec_command_all_ray_node, dataclass_cli
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
 
 
+def collect_probe_runtime_env() -> dict[str, str]:
+    """Carry configured Probe tracking into the submitted Ray job."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if value and (key.startswith("PROBE_") or key in {"MILES_USE_PROBE", "MILES_RUN_ID"})
+    }
+
+
 def _pythonpath_with_sources(megatron_path: str, *additional_pythonpaths: str | None) -> str:
     entries = [str(repo_base_dir), megatron_path]
     for pythonpath in (*additional_pythonpaths, os.environ.get("PYTHONPATH")):
