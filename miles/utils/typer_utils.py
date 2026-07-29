@@ -33,6 +33,7 @@ def dataclass_cli(
 
     Supports field ``metadata`` keys:
     - ``"help"``: passed as ``help=`` to ``typer.Option``
+    - ``"sensitive"``: redact the value from the printed argument table
 
     Usage::
 
@@ -90,7 +91,7 @@ def _wrap(func: _F, *, env_var_prefix: str) -> _F:
         print(f"| {'Argument':<{max_key_len}} | {'Value':<50} |")
         print(sep)
         for f in fields:
-            val = str(getattr(data, f.name))
+            val = "<redacted>" if f.metadata.get("sensitive") else str(getattr(data, f.name))
             if len(val) > 50:
                 val = val[:47] + "..."
             print(f"| {f.name:<{max_key_len}} | {val:<50} |")

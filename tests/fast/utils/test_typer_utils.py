@@ -112,6 +112,11 @@ class _EmptyMetaArgs:
 
 
 @dataclasses.dataclass
+class _SensitiveArgs:
+    token: str = dataclasses.field(default="live-secret", metadata={"sensitive": True})
+
+
+@dataclasses.dataclass
 class _MultipleRequiredArgs:
     alpha: str
     beta: str
@@ -124,6 +129,21 @@ class _MultipleRequiredArgs:
 
 
 class TestBareDecorator:
+    def test_sensitive_field_is_redacted_from_argument_table(self) -> None:
+        app = typer.Typer()
+        received: list[_SensitiveArgs] = []
+
+        @app.command()
+        @dataclass_cli
+        def cmd(args: _SensitiveArgs) -> None:
+            received.append(args)
+
+        result = runner.invoke(app, [])
+        assert result.exit_code == 0
+        assert received[0].token == "live-secret"
+        assert "live-secret" not in result.stdout
+        assert "<redacted>" in result.stdout
+
     def test_env_vars(self) -> None:
         app = typer.Typer()
 

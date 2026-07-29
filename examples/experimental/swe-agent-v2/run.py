@@ -12,7 +12,7 @@ import os
 import socket
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -56,8 +56,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
         "AGENT_SERVER_URL", os.environ.get("SWE_AGENT_URL", "http://agent_env:11000")
     )
     agent_model_name: str = os.environ.get("AGENT_MODEL_NAME", "model")
-    agent_server_auth_token: str = os.environ.get(
-        "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+    agent_server_auth_token: str = field(
+        default=os.environ.get(
+            "AGENT_SERVER_AUTH_TOKEN", os.environ.get("MILES_HARBOR_AUTH_TOKEN", "")
+        ),
+        metadata={"sensitive": True},
     )
     agent_server_timeout_sec: float = float(os.environ.get("AGENT_SERVER_TIMEOUT_SEC", "14400"))
     session_server_port: int = int(os.environ.get("MILES_SESSION_SERVER_PORT", "30000"))
@@ -68,7 +71,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     miles_host_ip: str = os.environ.get("MILES_HOST_IP", socket.gethostname())  # cluster/pod IP
 
     # W&B settings
-    wandb_key: str = os.environ.get("WANDB_KEY", os.environ.get("WANDB_API_KEY", ""))
+    wandb_key: str = field(
+        default=os.environ.get("WANDB_KEY", os.environ.get("WANDB_API_KEY", "")),
+        metadata={"sensitive": True},
+    )
     wandb_project: str = os.environ.get("WANDB_PROJECT", "glm47-flash-agentic")
     wandb_team: str = os.environ.get("WANDB_TEAM", "")
     wandb_run_name: str = "glm47-flash-swe-tito"
