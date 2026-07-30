@@ -109,7 +109,14 @@ def _collect_values(all_metrics: list[dict], key: str) -> list[float]:
 
 
 def _collect_present_numbers(all_metrics: list[dict], key: str) -> list[float]:
-    return [float(value) for metric in all_metrics if key in metric and (value := metric[key]) is not None and isinstance(value, int | float) and not isinstance(value, bool)]
+    return [
+        float(value)
+        for metric in all_metrics
+        if key in metric
+        and (value := metric[key]) is not None
+        and isinstance(value, int | float)
+        and not isinstance(value, bool)
+    ]
 
 
 def _agg_mean(metrics, all_metrics, keys, prefix="agent/", suffix="_mean"):

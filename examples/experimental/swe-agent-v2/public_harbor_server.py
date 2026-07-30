@@ -864,7 +864,9 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
         trial_task.cancel()
         if monitor_task is not None:
             monitor_task.cancel()
-        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
+        )
         response = RunResponse(exit_status="TimeLimitExceeded")
     except asyncio.CancelledError:
         raise
@@ -876,7 +878,9 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             trial_task.cancel()
         if monitor_task is not None and not monitor_task.done():
             monitor_task.cancel()
-        await asyncio.gather(*(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (trial_task, monitor_task) if task is not None), return_exceptions=True
+        )
 
         if settings.capture_mode != "off":
             trial_id = str(trial.id)
