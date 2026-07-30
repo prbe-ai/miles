@@ -50,8 +50,6 @@ _HOST_AGENTS = {"terminus", "terminus-1", "terminus-2"}
 # Settings validation never needs probe imported when capture is off.
 _CAPTURE_MODES = frozenset({"off", "shadow", "required"})
 
-_BEGIN_BYTES_BUNDLE_MEMBER = "artifacts/probe-sandbox-state/meta.json"
-
 
 class BeginBytesLedger:
     """Elects one trial per ``(run, task)`` to archive begin-state bytes.
@@ -119,23 +117,6 @@ async def _elect_begin_bytes(
     key = (run_key, ref)
     captured = await _BEGIN_BYTES_LEDGER.claim(*key)
     return captured, ref, (key if captured else None)
-
-
-def _begin_bytes_captured(trial_dir: Path) -> bool:
-    """Whether the authored bundle recorded a begin-bytes archive for this trial.
-
-    The SDK recorder writes ``meta.json`` into the trial tree at AGENT_END; its
-    ``begin_bytes.captured`` is the precise signal for the election's
-    release-on-failure (the facade's summary only exposes begin/end verified).
-    Fail-open: an unreadable/absent bundle counts as not-captured, which re-opens
-    the slot (a harmless duplicate attempt next time, never a wrong diff).
-    """
-    try:
-        meta = json.loads((trial_dir / _BEGIN_BYTES_BUNDLE_MEMBER).read_text())
-    except (OSError, ValueError):
-        return False
-    block = meta.get("begin_bytes")
-    return isinstance(block, dict) and block.get("captured") is True
 
 
 class RunRequest(BaseModel):
@@ -661,11 +642,13 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
                     error=result.error,
                 )
                 # Close the begin-bytes election: a failed archive re-opens the
-                # (run, task) slot so a later rollout of this task retries.
+                # (run, task) slot so a later rollout of this task retries. The
+                # SDK reports capture status on the finalize result (probe-research
+                # >= 0.26.0), so no re-reading the authored bundle.
                 if begin_bytes_key is not None:
                     await _BEGIN_BYTES_LEDGER.release(
                         *begin_bytes_key,
-                        succeeded=_begin_bytes_captured(trial_dir),
+                        succeeded=bool(getattr(result, "begin_bytes_captured", False)),
                     )
             else:
                 capture = CaptureResult(status="failed", error=attach_error or "capture attach failed")

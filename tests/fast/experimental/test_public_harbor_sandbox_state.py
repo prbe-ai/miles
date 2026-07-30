@@ -129,19 +129,9 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
 
         async def finalize(self, trial_dir, **kwargs):
             seen.update({"finalize_trial_dir": Path(trial_dir), **kwargs})
-            # Mirror the SDK recorder authoring meta.json into the trial tree, so
-            # the bridge's release-on-failure read has a bundle to inspect.
-            captured = bool(getattr(self._options, "begin_bytes", False))
-            bundle = Path(trial_dir) / "artifacts" / "probe-sandbox-state"
-            bundle.mkdir(parents=True, exist_ok=True)
-            meta = {"schema": "probe.sandbox-state/1"}
-            if captured or getattr(self._options, "begin_bytes_ref", None) is not None:
-                meta["begin_bytes"] = {
-                    "captured": captured,
-                    "ref": getattr(self._options, "begin_bytes_ref", None),
-                }
-            (bundle / "meta.json").write_text(json.dumps(meta))
             recorder_summary = self.sandbox_state.summary() if self.sandbox_state is not None else None
+            # The SDK (>= 0.26.0) reports capture status on the result; simulate a
+            # verified archive whenever begin_bytes was requested.
             return SimpleNamespace(
                 status="complete",
                 staged_trial_dir=str(trial_dir),
@@ -155,6 +145,7 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
                 sandbox_id="sbx__env",
                 provider_sandbox_id=None,
                 sandbox_state=recorder_summary,
+                begin_bytes_captured=bool(getattr(self._options, "begin_bytes", False)),
                 error=None,
             )
 
@@ -384,12 +375,19 @@ async def test_ledger_elects_one_and_reelects_only_after_failure() -> None:
     assert await ledger.claim("r", "other") is True  # different task -> own capture
 
 
-def test_begin_bytes_captured_reads_bundle_meta(tmp_path: Path) -> None:
-    bundle = tmp_path / "artifacts" / "probe-sandbox-state"
-    bundle.mkdir(parents=True)
-    (bundle / "meta.json").write_text(json.dumps({"begin_bytes": {"captured": True}}))
-    assert server._begin_bytes_captured(tmp_path) is True
-    (bundle / "meta.json").write_text(json.dumps({"begin_bytes": {"captured": False}}))
-    assert server._begin_bytes_captured(tmp_path) is False
-    # Fail-open: absent/unreadable bundle counts as not-captured (re-opens slot).
-    assert server._begin_bytes_captured(tmp_path / "nope") is False
+@pytest.mark.asyncio
+async def test_election_latches_on_captured_result_from_finalize(tmp_path: Path, monkeypatch) -> None:
+    """The elected trial's release reads result.begin_bytes_captured (SDK >=
+    0.26.0): a captured run latches the (run, task) slot so siblings don't
+    re-capture."""
+    _install_fake_harbor(monkeypatch)
+    _fresh_ledger(monkeypatch)
+    (tmp_path / "tasks" / "hello-world").mkdir(parents=True)
+    settings = _settings(tmp_path, sandbox_state_begin_bytes=True)
+
+    _install_fake_probe(monkeypatch)  # fake finalize -> begin_bytes_captured=True
+    await server.run_public_harbor_trial(_run_request("hello-world"), settings)
+
+    # Slot latched: a fresh sibling rollout is denied capture.
+    captured, ref, key = await server._elect_begin_bytes(settings, _run_request("hello-world"))
+    assert captured is False and key is None and ref == "hello-world"
