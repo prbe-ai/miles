@@ -258,6 +258,8 @@ Then open `http://<host>:8081` in a browser.
 | `MILES_SANDBOX_STATE_TIMEOUT_END` | `300` | Seconds allowed for the end snapshot and delta tar |
 | `MILES_SANDBOX_STATE_EXCLUDE` | unset | Colon-separated extra container path prefixes to exclude from scans |
 | `MILES_SANDBOX_STATE_HASH` | `false` | sha256 every file in the manifests (slow; catches mtime-preserving edits) |
+| `MILES_SANDBOX_STATE_BEGIN_BYTES` | `false` | Archive the sandbox's begin-state **bytes** (`begin-bytes.tar.gz`), not just the manifest, so modified files get true before/after diffs and deleted files' contents are recoverable. One trial per `(run, task)` captures; siblings stamp a shared `begin_bytes_ref`. Forces `--hash` on begin and, if the begin timeout is unset, raises its default to `600`. Requires `MILES_SANDBOX_STATE=1` and probe-research ≥ 0.24.0 |
+| `MILES_SANDBOX_STATE_MAX_BEGIN_BYTES` | unset | Byte ceiling for the begin archive (default 32 GiB in the binary, further capped at 50% of free space) |
 | `HARBOR_DELETE_ENVIRONMENTS` | `true` | Whether Harbor deletes the sandbox during `Trial.run()` cleanup |
 | `HARBOR_ADMIN_SECRET` | unset | Optional bearer secret for `/flush`; falls back to the bridge auth token |
 | `MILES_ROUTER_EXTERNAL_HOST` | `$(hostname)` | Hostname for agent containers to reach Miles Router |

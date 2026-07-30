@@ -11,3 +11,5 @@
 # wheel.
 probe-research @ git+https://github.com/prbe-ai/research-os-agent.git@main
 # After 0.9.1 is on PyPI the line above may be replaced with: probe-research>=0.9.1
+# NOTE: MILES_SANDBOX_STATE_BEGIN_BYTES needs the begin-bytes contract from
+# probe-research >= 0.24.0 (present on @main); pin >=0.24.0 if you switch to PyPI.

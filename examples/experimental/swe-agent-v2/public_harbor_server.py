@@ -59,6 +59,77 @@ _SANDBOX_STATE_OUTPUTS = {
     "begin": ("begin-manifest.jsonl.gz",),
     "end": ("end-manifest.jsonl.gz", "end-delta.tar.gz"),
 }
+_BEGIN_BYTES_OUTPUT = "begin-bytes.tar.gz"
+
+
+class BeginBytesLedger:
+    """Elects one trial per ``(run, task)`` to archive begin-state bytes.
+
+    Begin-state bytes are the whole scanned scope (~image size); capturing
+    them for every rollout of a task would multiply storage by the group size
+    for identical content. So exactly one trial per ``(run, task)`` captures
+    ``begin-bytes.tar.gz``; every other rollout of that task stamps only a
+    ``begin_bytes_ref`` pointing at it (the server resolves the shared archive
+    within the run, verifying per-file validity against each trial's own begin
+    manifest sha256s).
+
+    ``claim`` grants capture to the first caller for a ``(run, task)`` and
+    denies concurrent callers. ``release`` closes the attempt: on failure the
+    slot re-opens so a later rollout of the same task retries (a single flaky
+    trial must not permanently deny before-bytes for the task); on success it
+    latches closed. Correctness never depends on the election — duplicate
+    captures across processes are harmless (the server's content-addressed
+    blob store dedupes, and any winning archive satisfies the shared ref) — so
+    a per-process in-memory ledger is sufficient.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._state: dict[tuple[str, str], str] = {}  # key -> "inflight" | "done"
+
+    async def claim(self, run: str, task: str) -> bool:
+        key = (run, task)
+        async with self._lock:
+            if self._state.get(key) in ("inflight", "done"):
+                return False
+            self._state[key] = "inflight"
+            return True
+
+    async def release(self, run: str, task: str, *, succeeded: bool) -> None:
+        key = (run, task)
+        async with self._lock:
+            if succeeded:
+                self._state[key] = "done"
+            else:
+                self._state.pop(key, None)
+
+
+_BEGIN_BYTES_LEDGER = BeginBytesLedger()
+
+
+async def _elect_begin_bytes(
+    settings: Settings, request: RunRequest
+) -> tuple[bool, str | None, tuple[str, str] | None]:
+    """Decide whether this trial archives begin bytes, and its sharing ref.
+
+    Returns ``(capture_begin_bytes, begin_bytes_ref, ledger_key)``. When the
+    feature is on, ``begin_bytes_ref`` is stamped on EVERY trial of the task
+    (``instance_id`` — the task identity known before the trial runs, unlike
+    ``task_checksum`` which Harbor only reports afterward) so non-capturing
+    rollouts still point at the shared archive; only ``capture_begin_bytes``
+    is gated by the per-``(run, task)`` election. ``ledger_key`` is returned
+    (non-None only when this trial claimed capture) so the caller can release
+    the slot once the outcome is known.
+    """
+    if not (settings.sandbox_state and settings.sandbox_state_begin_bytes):
+        return False, None, None
+    ref = request.instance_id or None
+    if ref is None:
+        return False, None, None
+    run_key = str(request.run_id or request.miles_run_id or "")
+    key = (run_key, ref)
+    captured = await _BEGIN_BYTES_LEDGER.claim(*key)
+    return captured, ref, (key if captured else None)
 
 
 class RunRequest(BaseModel):
@@ -141,6 +212,8 @@ class Settings:
     sandbox_state_end_timeout_sec: float = 300.0
     sandbox_state_exclude: str = ""
     sandbox_state_hash: bool = False
+    sandbox_state_begin_bytes: bool = False
+    sandbox_state_max_begin_bytes: int | None = None
     environment_type: str = "docker"
     environment_kwargs: dict[str, Any] = field(default_factory=dict)
     delete_environments: bool = True
@@ -157,7 +230,11 @@ class Settings:
             choices = ", ".join(sorted(_CAPTURE_MODES))
             raise ValueError(f"MILES_HARBOR_CAPTURE_MODE must be one of: {choices}")
         if self.sandbox_state and self.capture_mode == "off":
-            raise ValueError("MILES_SANDBOX_STATE=1 requires MILES_HARBOR_CAPTURE_MODE=shadow or required; the sandbox-state bundle ships inside the staged capture")
+            raise ValueError(
+                "MILES_SANDBOX_STATE=1 requires MILES_HARBOR_CAPTURE_MODE=shadow or required; the sandbox-state bundle ships inside the staged capture"
+            )
+        if self.sandbox_state_begin_bytes and not self.sandbox_state:
+            raise ValueError("MILES_SANDBOX_STATE_BEGIN_BYTES=1 requires MILES_SANDBOX_STATE=1")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -172,16 +249,26 @@ class Settings:
 
         trials_dir = Path(os.getenv("HARBOR_TRIALS_DIR", "./trials"))
         default_capture_dir = trials_dir.parent / f"{trials_dir.name}-captures"
+        begin_bytes = _env_bool("MILES_SANDBOX_STATE_BEGIN_BYTES", False)
+        # Archiving + downloading the whole scope (GiBs) cannot fit the 120s
+        # metadata-only default; bump to 600s when begin-bytes is on unless the
+        # operator set an explicit begin timeout.
+        default_begin_timeout = "600" if begin_bytes else "120"
+        raw_max_begin = os.getenv("MILES_SANDBOX_STATE_MAX_BEGIN_BYTES")
         return cls(
             tasks_dir=Path(os.getenv("HARBOR_TASKS_DIR", "/root/harbor_tasks")),
             trials_dir=trials_dir,
             capture_dir=Path(os.getenv("MILES_HARBOR_CAPTURE_DIR", str(default_capture_dir))),
             capture_mode=os.getenv("MILES_HARBOR_CAPTURE_MODE", "off").strip().lower(),
             sandbox_state=_env_bool("MILES_SANDBOX_STATE", False),
-            sandbox_state_begin_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "120")),
+            sandbox_state_begin_timeout_sec=float(
+                os.getenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", default_begin_timeout)
+            ),
             sandbox_state_end_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_END", "300")),
             sandbox_state_exclude=os.getenv("MILES_SANDBOX_STATE_EXCLUDE", ""),
             sandbox_state_hash=_env_bool("MILES_SANDBOX_STATE_HASH", False),
+            sandbox_state_begin_bytes=begin_bytes,
+            sandbox_state_max_begin_bytes=int(raw_max_begin) if raw_max_begin else None,
             environment_type=os.getenv("HARBOR_ENVIRONMENT_TYPE", "docker"),
             environment_kwargs=environment_kwargs,
             delete_environments=_env_bool("HARBOR_DELETE_ENVIRONMENTS", True),
@@ -225,7 +312,9 @@ def validate_callback_url(base_url: str, settings: Settings) -> None:
     if settings.allow_any_callback:
         return
     if parsed.hostname.lower() not in settings.allowed_callback_hosts:
-        raise ValueError(f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS")
+        raise ValueError(
+            f"Callback host {parsed.hostname!r} is not allowed; add it to MILES_HARBOR_ALLOWED_CALLBACK_HOSTS"
+        )
 
 
 def validate_session_server_id(session_server_id: str, settings: Settings) -> None:
@@ -316,7 +405,11 @@ def stage_trial_capture(
         archive_content_hash=archive.get("content_hash"),
         external_key=descriptor_correlation.get("external_key"),
         file_count=len(files),
-        size_bytes=sum(item.get("size_bytes", 0) for item in files if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)),
+        size_bytes=sum(
+            item.get("size_bytes", 0)
+            for item in files
+            if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)
+        ),
     )
 
 
@@ -338,7 +431,15 @@ class SandboxStateCapture:
     trial tree, outside agent reach, and rides the existing staged capture.
     """
 
-    def __init__(self, trial: Any, settings: Settings, host_dir: Path) -> None:
+    def __init__(
+        self,
+        trial: Any,
+        settings: Settings,
+        host_dir: Path,
+        *,
+        capture_begin_bytes: bool = False,
+        begin_bytes_ref: str | None = None,
+    ) -> None:
         self._trial = trial
         self._settings = settings
         self._host_dir = host_dir
@@ -348,6 +449,14 @@ class SandboxStateCapture:
         self._integrity: dict[str, bool] = {}
         self._errors: list[str] = []
         self.status: dict[str, str | None] = {"begin": None, "end": None}
+        self._capture_begin_bytes = capture_begin_bytes
+        self._begin_bytes_ref = begin_bytes_ref
+        # Per-phase output allowlist (never the untrusted trailer's own keys):
+        # begin gains the archive only when this trial won the capture election.
+        self._outputs: dict[str, tuple[str, ...]] = {
+            "begin": _SANDBOX_STATE_OUTPUTS["begin"] + ((_BEGIN_BYTES_OUTPUT,) if capture_begin_bytes else ()),
+            "end": _SANDBOX_STATE_OUTPUTS["end"],
+        }
 
     def install(self) -> None:
         from harbor.trial.hooks import TrialEvent
@@ -357,7 +466,11 @@ class SandboxStateCapture:
 
     def _hook(self, phase: str) -> Callable[[Any], Awaitable[None]]:
         async def callback(_event: Any) -> None:
-            timeout = self._settings.sandbox_state_begin_timeout_sec if phase == "begin" else self._settings.sandbox_state_end_timeout_sec
+            timeout = (
+                self._settings.sandbox_state_begin_timeout_sec
+                if phase == "begin"
+                else self._settings.sandbox_state_end_timeout_sec
+            )
             try:
                 await asyncio.wait_for(self._run_phase(phase), timeout=timeout)
                 self.status[phase] = "ok"
@@ -373,7 +486,11 @@ class SandboxStateCapture:
         if phase == "end" and self.status.get("begin") != "ok":
             raise RuntimeError("begin snapshot unavailable; end delta skipped")
         env = self._trial.agent_environment
-        phase_timeout = self._settings.sandbox_state_begin_timeout_sec if phase == "begin" else self._settings.sandbox_state_end_timeout_sec
+        phase_timeout = (
+            self._settings.sandbox_state_begin_timeout_sec
+            if phase == "begin"
+            else self._settings.sandbox_state_end_timeout_sec
+        )
         # exec timeout bounds the HOST wait; the binary's own --max-seconds
         # (set below it) bounds the in-CONTAINER process so a runaway scan
         # exits itself rather than lingering past the agent phase. Both are
@@ -396,16 +513,23 @@ class SandboxStateCapture:
                     f"{workdir}/begin.jsonl.gz",
                 )
                 command += f" --begin-manifest {workdir}/begin.jsonl.gz"
+            if phase == "begin" and self._capture_begin_bytes:
+                command += " --bytes"
+                if self._settings.sandbox_state_max_begin_bytes is not None:
+                    command += f" --max-begin-bytes {self._settings.sandbox_state_max_begin_bytes}"
             if self._settings.sandbox_state_exclude:
                 command += f" --exclude {shlex.quote(self._settings.sandbox_state_exclude)}"
-            if self._settings.sandbox_state_hash:
+            # Begin-bytes validity is a per-file sha256 join against the begin
+            # manifest, so hashing is mandatory whenever we archive begin bytes
+            # (mtime nondeterminism between rollouts would otherwise defeat it).
+            if self._settings.sandbox_state_hash or (phase == "begin" and self._capture_begin_bytes):
                 command += " --hash"
             result = await env.exec(command, user="root", timeout_sec=exec_timeout)
             if result.return_code != 0:
                 stderr_tail = (result.stderr or "").strip()[-500:]
                 raise RuntimeError(f"snapshot exited {result.return_code}: {stderr_tail}")
             trailer = sandbox_state.parse_trailer(result.stdout or "")
-            for name in _SANDBOX_STATE_OUTPUTS[phase]:
+            for name in self._outputs[phase]:
                 target = self._host_dir / name
                 await env.download_file(f"{workdir}/{name}", target)
                 declared = trailer.get("files", {}).get(name, {}).get("sha256")
@@ -442,6 +566,14 @@ class SandboxStateCapture:
     def attempted(self) -> bool:
         return any(value is not None for value in self.status.values())
 
+    def begin_bytes_captured(self) -> bool:
+        """True iff this trial produced an integrity-verified begin archive.
+
+        The election ledger releases on the negation of this so a failed
+        attempt re-opens the ``(run, task)`` slot for a later rollout.
+        """
+        return self._capture_begin_bytes and self._integrity.get(_BEGIN_BYTES_OUTPUT, False)
+
     def write_bundle(self, trial_dir: Path) -> dict[str, Any]:
         """Author the bundle into the host trial tree; sync, never raises.
 
@@ -462,10 +594,11 @@ class SandboxStateCapture:
                     arch=self._arch,
                     integrity=self._integrity,
                     errors=self._errors,
+                    begin_bytes_ref=self._begin_bytes_ref,
                 )
                 sandbox_state.write_bundle(
                     trial_dir / "artifacts" / sandbox_state.BUNDLE_DIRNAME,
-                    {name: self._host_dir / name for outputs in _SANDBOX_STATE_OUTPUTS.values() for name in outputs},
+                    {name: self._host_dir / name for outputs in self._outputs.values() for name in outputs},
                     meta,
                 )
         except Exception as exc:  # noqa: BLE001 - bundle loss must not fail staging
@@ -527,7 +660,11 @@ def build_agent_configuration(request: RunRequest) -> tuple[dict[str, str], dict
         temperature = sampling.get("temperature")
         if isinstance(temperature, int | float) and not isinstance(temperature, bool):
             agent_kwargs["temperature"] = float(temperature)
-        forwarded = {key: value for key, value in sampling.items() if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None}
+        forwarded = {
+            key: value
+            for key, value in sampling.items()
+            if key in {"max_tokens", "top_p", "seed", "stop"} and value is not None
+        }
         if forwarded:
             agent_kwargs["llm_call_kwargs"] = forwarded
 
@@ -614,7 +751,9 @@ async def _poll_until_sequence_limit(request: RunRequest, settings: Settings) ->
             health.raise_for_status()
             actual_id = health.json().get("session_server_instance_id")
             if actual_id != request.session_server_instance_id:
-                raise RuntimeError(f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})")
+                raise RuntimeError(
+                    f"Miles session-server identity changed during rollout (expected {request.session_server_instance_id!r}, got {actual_id!r})"
+                )
 
         while True:
             try:
@@ -659,11 +798,19 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
     trial = await Trial.create(config)
 
     sandbox_capture: SandboxStateCapture | None = None
+    begin_bytes_key: tuple[str, str] | None = None
     if settings.sandbox_state:
         capture_root = settings.capture_dir.expanduser().resolve()
         capture_root.mkdir(parents=True, exist_ok=True)
         host_dir = Path(tempfile.mkdtemp(prefix=".psbx-host-", dir=capture_root))
-        sandbox_capture = SandboxStateCapture(trial, settings, host_dir)
+        capture_begin_bytes, begin_bytes_ref, begin_bytes_key = await _elect_begin_bytes(settings, request)
+        sandbox_capture = SandboxStateCapture(
+            trial,
+            settings,
+            host_dir,
+            capture_begin_bytes=capture_begin_bytes,
+            begin_bytes_ref=begin_bytes_ref,
+        )
         try:
             sandbox_capture.install()
         except Exception as exc:  # noqa: BLE001 - capture is best-effort, trial must run
@@ -745,6 +892,12 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
                     **request.capture_context,
                     "sandbox_state": sandbox_state_summary,
                 }
+                # Close the begin-bytes election: a failed archive re-opens the
+                # (run, task) slot so a later rollout of this task retries.
+                if begin_bytes_key is not None:
+                    await _BEGIN_BYTES_LEDGER.release(
+                        *begin_bytes_key, succeeded=sandbox_capture.begin_bytes_captured()
+                    )
             try:
                 capture = await asyncio.to_thread(
                     stage_trial_capture,
@@ -824,7 +977,9 @@ def create_app(
 
     def require_bearer(http_request: Request, *tokens: str) -> None:
         expected = [f"Bearer {token}" for token in tokens if token]
-        if expected and not any(secrets.compare_digest(http_request.headers.get("authorization", ""), item) for item in expected):
+        if expected and not any(
+            secrets.compare_digest(http_request.headers.get("authorization", ""), item) for item in expected
+        ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     @app.get("/health")

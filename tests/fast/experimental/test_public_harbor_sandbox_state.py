@@ -71,7 +71,10 @@ class FakeEnvironment:
         payload = {
             "schema": sandbox_state.TRAILER_SCHEMA,
             "phase": phase,
-            "files": {name: {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)} for name, data in files.items()},
+            "files": {
+                name: {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+                for name, data in files.items()
+            },
             "stats": {"entries": 3, "files_scanned": 2, "added": 1, "modified": 0, "deleted": 0},
             "errors": [],
             "hash_mode": "fast",
@@ -91,6 +94,8 @@ class FakeEnvironment:
         workdir = command.split("--workdir ")[1].split()[0]
         if phase == "begin":
             files = {"begin-manifest.jsonl.gz": _gzip_jsonl_bytes([{"p": "/b"}, {"p": "/a"}])}
+            if "--bytes" in command:
+                files["begin-bytes.tar.gz"] = b"begin-archive-bytes"
         else:
             files = {
                 "end-manifest.jsonl.gz": _gzip_jsonl_bytes([{"p": "/a"}, {"p": "/new"}]),
@@ -133,13 +138,15 @@ def _settings(tmp_path: Path, **overrides) -> server.Settings:
     return server.Settings(**defaults)
 
 
-def _capture(tmp_path: Path, monkeypatch, **settings_overrides):
+def _capture(tmp_path: Path, monkeypatch, *, capture_kwargs=None, **settings_overrides):
     _install_fake_hooks_module(monkeypatch)
     monkeypatch.setenv("PROBE_SANDBOX_SNAPSHOT_BIN", __file__)  # any real file
     trial = FakeTrial()
     host_dir = tmp_path / "host"
     host_dir.mkdir(parents=True)
-    capture = server.SandboxStateCapture(trial, _settings(tmp_path, **settings_overrides), host_dir)
+    capture = server.SandboxStateCapture(
+        trial, _settings(tmp_path, **settings_overrides), host_dir, **(capture_kwargs or {})
+    )
     capture.install()
     return trial, capture
 
@@ -266,3 +273,141 @@ def test_unknown_arch_falls_back_to_amd64(tmp_path: Path, monkeypatch) -> None:
     assert capture.status["begin"] == "ok"
     assert capture.summary()["arch"] == "amd64"
     assert any("unrecognized machine" in err for err in capture.summary()["errors"])
+
+
+# ---------------------------------------------------------------------------
+# begin-state bytes (probe-research 0.24.0): per-task shared before-content
+# ---------------------------------------------------------------------------
+def test_begin_bytes_captured_rides_bundle_and_meta(tmp_path: Path, monkeypatch) -> None:
+    trial, capture = _capture(
+        tmp_path,
+        monkeypatch,
+        sandbox_state_begin_bytes=True,
+        capture_kwargs={"capture_begin_bytes": True, "begin_bytes_ref": "task-abc"},
+    )
+    env = trial.agent_environment
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_START))
+    assert capture.status["begin"] == "ok"
+
+    # --bytes flows to the begin exec, and only the begin exec.
+    begin_execs = [c for c in env.execs if " begin " in c]
+    assert begin_execs and all("--bytes" in c for c in begin_execs)
+    assert not any("--bytes" in c for c in env.execs if " end " in c)
+    # Archive was downloaded and integrity-verified alongside the manifest.
+    assert capture._integrity["begin-bytes.tar.gz"] is True
+    assert capture.begin_bytes_captured() is True
+
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_END))
+    trial_dir = tmp_path / "trial-out"
+    capture.write_bundle(trial_dir)
+    bundle = trial_dir / "artifacts" / sandbox_state.BUNDLE_DIRNAME
+    assert (bundle / "begin-bytes.tar.gz").read_bytes() == b"begin-archive-bytes"
+    meta = json.loads((bundle / "meta.json").read_text())
+    assert meta["begin_bytes"]["captured"] is True
+    assert meta["begin_bytes"]["ref"] == "task-abc"
+
+
+def test_begin_bytes_ref_without_capture_stamps_meta_only(tmp_path: Path, monkeypatch) -> None:
+    trial, capture = _capture(
+        tmp_path,
+        monkeypatch,
+        sandbox_state_begin_bytes=True,
+        capture_kwargs={"capture_begin_bytes": False, "begin_bytes_ref": "task-abc"},
+    )
+    env = trial.agent_environment
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_START))
+    assert not any("--bytes" in c for c in env.execs)
+    assert capture.begin_bytes_captured() is False
+
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_END))
+    trial_dir = tmp_path / "trial-out"
+    capture.write_bundle(trial_dir)
+    bundle = trial_dir / "artifacts" / sandbox_state.BUNDLE_DIRNAME
+    assert not (bundle / "begin-bytes.tar.gz").exists()
+    meta = json.loads((bundle / "meta.json").read_text())
+    assert meta["begin_bytes"] == {
+        "captured": False,
+        "ref": "task-abc",
+        "budget_bytes": None,
+        "truncated": False,
+        "dropped_count": 0,
+    }
+
+
+def test_feature_off_leaves_no_begin_bytes_block(tmp_path: Path, monkeypatch) -> None:
+    trial, capture = _capture(tmp_path, monkeypatch)  # no begin-bytes
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_START))
+    asyncio.run(trial.emit(FakeTrialEvent.AGENT_END))
+    trial_dir = tmp_path / "trial-out"
+    capture.write_bundle(trial_dir)
+    meta = json.loads((trial_dir / "artifacts" / sandbox_state.BUNDLE_DIRNAME / "meta.json").read_text())
+    assert "begin_bytes" not in meta
+
+
+def test_settings_begin_bytes_bumps_begin_timeout_default(monkeypatch) -> None:
+    monkeypatch.setenv("HARBOR_TASKS_DIR", "/tmp/tasks")
+    monkeypatch.setenv("MILES_HARBOR_CAPTURE_MODE", "shadow")
+    monkeypatch.setenv("MILES_SANDBOX_STATE", "1")
+    monkeypatch.setenv("MILES_SANDBOX_STATE_BEGIN_BYTES", "1")
+    monkeypatch.delenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", raising=False)
+    s = server.Settings.from_env()
+    assert s.sandbox_state_begin_bytes is True
+    assert s.sandbox_state_begin_timeout_sec == 600.0
+    # Explicit override still wins.
+    monkeypatch.setenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "200")
+    assert server.Settings.from_env().sandbox_state_begin_timeout_sec == 200.0
+
+
+# ---- election ledger: one capture per (run, task), re-elects on failure ----
+def test_ledger_elects_one_trial_per_task() -> None:
+    ledger = server.BeginBytesLedger()
+
+    async def scenario():
+        first = await ledger.claim("run1", "taskA")
+        second = await ledger.claim("run1", "taskA")  # in-flight -> denied
+        other_task = await ledger.claim("run1", "taskB")
+        other_run = await ledger.claim("run2", "taskA")
+        return first, second, other_task, other_run
+
+    first, second, other_task, other_run = asyncio.run(scenario())
+    assert first is True
+    assert second is False  # someone already capturing this (run, task)
+    assert other_task is True  # different task -> its own capture
+    assert other_run is True  # different run -> its own capture
+
+
+def test_ledger_reelects_after_failed_capture_but_not_after_success() -> None:
+    ledger = server.BeginBytesLedger()
+
+    async def scenario():
+        assert await ledger.claim("r", "t") is True
+        await ledger.release("r", "t", succeeded=False)  # first attempt failed
+        regrant = await ledger.claim("r", "t")  # a later rollout retries
+        assert regrant is True
+        await ledger.release("r", "t", succeeded=True)  # this one worked
+        after_success = await ledger.claim("r", "t")  # no more captures needed
+        return after_success
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_elect_begin_bytes_shares_one_capture_across_a_group(tmp_path: Path) -> None:
+    """Two rollouts of the same task in a run: first captures, rest ref-only."""
+    settings = _settings(tmp_path, sandbox_state_begin_bytes=True)
+    req = SimpleNamespace(instance_id="swebench-42", run_id="run-1", miles_run_id=None)
+
+    async def scenario():
+        a = await server._elect_begin_bytes(settings, req)
+        b = await server._elect_begin_bytes(settings, req)  # sibling rollout, same task
+        return a, b
+
+    (cap_a, ref_a, key_a), (cap_b, ref_b, key_b) = asyncio.run(scenario())
+    assert cap_a is True and key_a == ("run-1", "swebench-42")
+    assert cap_b is False and key_b is None  # sibling doesn't re-capture
+    assert ref_a == ref_b == "swebench-42"  # both stamp the shared ref
+
+
+def test_elect_begin_bytes_off_when_feature_disabled(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)  # begin_bytes feature off
+    req = SimpleNamespace(instance_id="swebench-42", run_id="run-1", miles_run_id=None)
+    assert asyncio.run(server._elect_begin_bytes(settings, req)) == (False, None, None)
