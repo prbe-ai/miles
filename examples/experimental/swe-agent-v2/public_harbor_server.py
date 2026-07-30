@@ -50,6 +50,93 @@ _HOST_AGENTS = {"terminus", "terminus-1", "terminus-2"}
 # Settings validation never needs probe imported when capture is off.
 _CAPTURE_MODES = frozenset({"off", "shadow", "required"})
 
+_BEGIN_BYTES_BUNDLE_MEMBER = "artifacts/probe-sandbox-state/meta.json"
+
+
+class BeginBytesLedger:
+    """Elects one trial per ``(run, task)`` to archive begin-state bytes.
+
+    Begin-state bytes are the whole scanned scope (~image size); capturing them
+    for every rollout of a task would multiply storage by the group size for
+    identical content. So exactly one trial per ``(run, task)`` sets
+    ``SandboxStateOptions.begin_bytes=True``; every other rollout stamps only a
+    shared ``begin_bytes_ref`` (the server resolves the shared archive within the
+    run, verifying per-file validity against each trial's begin manifest).
+
+    ``claim`` grants capture to the first caller for a ``(run, task)`` and denies
+    concurrent callers; ``release`` closes the attempt — on failure the slot
+    re-opens so a later rollout of the same task retries (a flaky first trial must
+    not permanently deny before-bytes), on success it latches. Correctness never
+    depends on the election: duplicate captures across processes are harmless (the
+    server's content-addressed blob store dedupes, any winning archive satisfies
+    the ref), so a per-process in-memory ledger suffices.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._state: dict[tuple[str, str], str] = {}  # key -> "inflight" | "done"
+
+    async def claim(self, run: str, task: str) -> bool:
+        key = (run, task)
+        async with self._lock:
+            if self._state.get(key) in ("inflight", "done"):
+                return False
+            self._state[key] = "inflight"
+            return True
+
+    async def release(self, run: str, task: str, *, succeeded: bool) -> None:
+        key = (run, task)
+        async with self._lock:
+            if succeeded:
+                self._state[key] = "done"
+            else:
+                self._state.pop(key, None)
+
+
+_BEGIN_BYTES_LEDGER = BeginBytesLedger()
+
+
+async def _elect_begin_bytes(
+    settings: Settings, request: RunRequest
+) -> tuple[bool, str | None, tuple[str, str] | None]:
+    """Decide whether this trial archives begin bytes, and its sharing ref.
+
+    Returns ``(capture_begin_bytes, begin_bytes_ref, ledger_key)``. When the
+    feature is on, ``begin_bytes_ref`` is stamped on EVERY trial of the task
+    (``instance_id`` — the task identity known before the trial runs, unlike
+    ``task_checksum`` which Harbor only reports afterward), so non-capturing
+    rollouts still point at the shared archive; only ``capture_begin_bytes`` is
+    gated by the per-``(run, task)`` election. ``ledger_key`` is non-None only
+    when this trial claimed capture, so the caller can release the slot once the
+    outcome is known.
+    """
+    if not (settings.sandbox_state and settings.sandbox_state_begin_bytes):
+        return False, None, None
+    ref = request.instance_id or None
+    if ref is None:
+        return False, None, None
+    run_key = str(request.run_id or request.miles_run_id or "")
+    key = (run_key, ref)
+    captured = await _BEGIN_BYTES_LEDGER.claim(*key)
+    return captured, ref, (key if captured else None)
+
+
+def _begin_bytes_captured(trial_dir: Path) -> bool:
+    """Whether the authored bundle recorded a begin-bytes archive for this trial.
+
+    The SDK recorder writes ``meta.json`` into the trial tree at AGENT_END; its
+    ``begin_bytes.captured`` is the precise signal for the election's
+    release-on-failure (the facade's summary only exposes begin/end verified).
+    Fail-open: an unreadable/absent bundle counts as not-captured, which re-opens
+    the slot (a harmless duplicate attempt next time, never a wrong diff).
+    """
+    try:
+        meta = json.loads((trial_dir / _BEGIN_BYTES_BUNDLE_MEMBER).read_text())
+    except (OSError, ValueError):
+        return False
+    block = meta.get("begin_bytes")
+    return isinstance(block, dict) and block.get("captured") is True
+
 
 class RunRequest(BaseModel):
     base_url: str
@@ -138,6 +225,8 @@ class Settings:
     sandbox_state_end_timeout_sec: float = 300.0
     sandbox_state_exclude: str = ""
     sandbox_state_hash: bool = False
+    sandbox_state_begin_bytes: bool = False
+    sandbox_state_max_begin_bytes: int | None = None
     environment_type: str = "docker"
     environment_kwargs: dict[str, Any] = field(default_factory=dict)
     delete_environments: bool = True
@@ -157,6 +246,8 @@ class Settings:
             raise ValueError(
                 "MILES_SANDBOX_STATE=1 requires MILES_HARBOR_CAPTURE_MODE=shadow or required; the sandbox-state bundle ships inside the staged capture"
             )
+        if self.sandbox_state_begin_bytes and not self.sandbox_state:
+            raise ValueError("MILES_SANDBOX_STATE_BEGIN_BYTES=1 requires MILES_SANDBOX_STATE=1")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -171,16 +262,26 @@ class Settings:
 
         trials_dir = Path(os.getenv("HARBOR_TRIALS_DIR", "./trials"))
         default_capture_dir = trials_dir.parent / f"{trials_dir.name}-captures"
+        begin_bytes = _env_bool("MILES_SANDBOX_STATE_BEGIN_BYTES", False)
+        # Archiving + downloading the whole scope (GiBs) can't fit the 120s
+        # metadata-only default; bump to 600s when begin-bytes is on unless the
+        # operator set an explicit begin timeout.
+        default_begin_timeout = "600" if begin_bytes else "120"
+        raw_max_begin = os.getenv("MILES_SANDBOX_STATE_MAX_BEGIN_BYTES")
         return cls(
             tasks_dir=Path(os.getenv("HARBOR_TASKS_DIR", "/root/harbor_tasks")),
             trials_dir=trials_dir,
             capture_dir=Path(os.getenv("MILES_HARBOR_CAPTURE_DIR", str(default_capture_dir))),
             capture_mode=os.getenv("MILES_HARBOR_CAPTURE_MODE", "off").strip().lower(),
             sandbox_state=_env_bool("MILES_SANDBOX_STATE", False),
-            sandbox_state_begin_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "120")),
+            sandbox_state_begin_timeout_sec=float(
+                os.getenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", default_begin_timeout)
+            ),
             sandbox_state_end_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_END", "300")),
             sandbox_state_exclude=os.getenv("MILES_SANDBOX_STATE_EXCLUDE", ""),
             sandbox_state_hash=_env_bool("MILES_SANDBOX_STATE_HASH", False),
+            sandbox_state_begin_bytes=begin_bytes,
+            sandbox_state_max_begin_bytes=int(raw_max_begin) if raw_max_begin else None,
             environment_type=os.getenv("HARBOR_ENVIRONMENT_TYPE", "docker"),
             environment_kwargs=environment_kwargs,
             delete_environments=_env_bool("HARBOR_DELETE_ENVIRONMENTS", True),
@@ -420,6 +521,7 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
     # Attach is fail-open — capture must never block the trial itself.
     handle = None
     attach_error: str | None = None
+    begin_bytes_key: tuple[str, str] | None = None
     if settings.capture_mode != "off":
         try:
             from probe.connectors import harbor_capture
@@ -428,11 +530,18 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
             if settings.sandbox_state:
                 from probe.connectors.harbor_runner import SandboxStateOptions
 
+                capture_begin_bytes, begin_bytes_ref, begin_bytes_key = await _elect_begin_bytes(settings, request)
                 sandbox_state_options = SandboxStateOptions(
                     begin_timeout_sec=settings.sandbox_state_begin_timeout_sec,
                     end_timeout_sec=settings.sandbox_state_end_timeout_sec,
-                    hash_files=settings.sandbox_state_hash,
+                    # Begin-bytes validity is a per-file sha256 join against the
+                    # begin manifest, so hashing is mandatory whenever we archive
+                    # begin bytes (mtime drift between rollouts would defeat reuse).
+                    hash_files=settings.sandbox_state_hash or capture_begin_bytes,
                     exclude=tuple(part for part in settings.sandbox_state_exclude.split(":") if part),
+                    begin_bytes=capture_begin_bytes,
+                    begin_bytes_ref=begin_bytes_ref,
+                    max_begin_bytes=settings.sandbox_state_max_begin_bytes,
                 )
             handle = harbor_capture.attach(
                 trial,
@@ -551,6 +660,13 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
                     sandbox_state=result.sandbox_state,
                     error=result.error,
                 )
+                # Close the begin-bytes election: a failed archive re-opens the
+                # (run, task) slot so a later rollout of this task retries.
+                if begin_bytes_key is not None:
+                    await _BEGIN_BYTES_LEDGER.release(
+                        *begin_bytes_key,
+                        succeeded=_begin_bytes_captured(trial_dir),
+                    )
             else:
                 capture = CaptureResult(status="failed", error=attach_error or "capture attach failed")
 
