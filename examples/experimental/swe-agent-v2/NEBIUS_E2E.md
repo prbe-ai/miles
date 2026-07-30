@@ -1100,10 +1100,12 @@ export MILES_SANDBOX_STATE=1
 export MILES_SANDBOX_STATE_BEGIN_BYTES=1
 # Scope the snapshot to the agent WORKSPACE, not the whole image. One root
 # governs both phases, so begin-bytes and the end delta cover the same tree —
-# small, fast, and low-disk. Set this to wherever the task's repo lives
-# (SWE-agent-v2 tasks build under /testbed). Leaving it unset scans "/" (the
-# entire rootfs, GBs per task) — do NOT do that on a real GPU run.
-export MILES_SANDBOX_STATE_ROOT=/testbed
+# small, fast, and low-disk. Set this to wherever the task's repo lives.
+# Terminal-Bench 2's smoke task and 88/89 exported tasks use /app (two use a
+# subdirectory below it); one exported task uses /workspace. The bounded smoke
+# below uses /app. Leaving this unset scans "/" (the entire rootfs, GBs per
+# task) — do NOT do that on a real GPU run.
+export MILES_SANDBOX_STATE_ROOT=/app
 # Optional hard ceiling on the begin archive (further capped at 50% free space;
 # binary default 32 GiB). A modest cap is a good guardrail for a first run.
 export MILES_SANDBOX_STATE_MAX_BEGIN_BYTES=$((2 * 1024 * 1024 * 1024))  # 2 GiB
@@ -1156,8 +1158,8 @@ Adding `MILES_SANDBOX_STATE_BEGIN_BYTES=1` also archives `begin-bytes.tar.gz`
 render a true before/after — a unified line diff for modified files and the
 recovered contents of deleted files — instead of "before not captured". To keep
 that archive small, scope `MILES_SANDBOX_STATE_ROOT` to the agent workspace
-(e.g. `/testbed`): one root governs both phases, so the before and after cover
-the same tree. Storage/latency note: the begin archive is captured **once per
+(`/app` for the Terminal-Bench 2 smoke task): one root governs both phases, so
+the before and after cover the same tree. Storage/latency note: the begin archive is captured **once per
 task** (the first rollout of each `instance_id`; the rest stamp a shared
 reference), inside that trial's `AGENT_START` window — so scoping the root and
 setting `MILES_SANDBOX_STATE_MAX_BEGIN_BYTES` keep both the per-task capture

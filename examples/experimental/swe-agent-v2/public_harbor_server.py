@@ -524,7 +524,7 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
                     # One scan root governs BOTH phases (begin manifest+bytes and
                     # end manifest+delta), so the before and after archives cover
                     # the same tree. Default "/" is the whole image; scope it to
-                    # the agent workspace (e.g. /testbed) to keep begin-bytes small.
+                    # the agent workspace (e.g. /app for TB2) to keep begin-bytes small.
                     root=settings.sandbox_state_root,
                     exclude=tuple(part for part in settings.sandbox_state_exclude.split(":") if part),
                     begin_bytes=capture_begin_bytes,
