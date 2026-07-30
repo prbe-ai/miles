@@ -1092,6 +1092,21 @@ export MILES_HARBOR_CAPTURE_MODE=shadow
 # Requires probe-research >= 0.23.0 (harbor_capture facade + packaged
 # probe-sandbox-snapshot binaries — install from git, see the capture reqs).
 export MILES_SANDBOX_STATE=1
+# Begin-state BYTES: archive the before-state so the dashboard shows a true
+# before/after (line diff for modified files, recovered contents for deleted
+# ones), not just metadata. One trial per task captures; siblings share it.
+# Needs probe-research >= 0.24.0 (present on @main). Forces --hash and raises
+# the begin-snapshot timeout default to 600s.
+export MILES_SANDBOX_STATE_BEGIN_BYTES=1
+# Scope the snapshot to the agent WORKSPACE, not the whole image. One root
+# governs both phases, so begin-bytes and the end delta cover the same tree —
+# small, fast, and low-disk. Set this to wherever the task's repo lives
+# (SWE-agent-v2 tasks build under /testbed). Leaving it unset scans "/" (the
+# entire rootfs, GBs per task) — do NOT do that on a real GPU run.
+export MILES_SANDBOX_STATE_ROOT=/testbed
+# Optional hard ceiling on the begin archive (further capped at 50% free space;
+# binary default 32 GiB). A modest cap is a good guardrail for a first run.
+export MILES_SANDBOX_STATE_MAX_BEGIN_BYTES=$((2 * 1024 * 1024 * 1024))  # 2 GiB
 export HARBOR_ENVIRONMENT_TYPE=modal
 # Keep the provider lifetime aligned with the four-hour bridge/client timeout.
 # Modal supports up to 24 hours, but a bounded value limits leaked compute.
@@ -1135,6 +1150,22 @@ With `MILES_SANDBOX_STATE=1` each staged trial additionally carries
 the agent's delta tarball, captured inside the sandbox at `AGENT_START` /
 `AGENT_END` via an uploaded static binary and removed from the container in
 the same instant (the sandbox is probe-free during the whole agent phase).
+
+Adding `MILES_SANDBOX_STATE_BEGIN_BYTES=1` also archives `begin-bytes.tar.gz`
+(the before-state bytes of the scanned scope), which is what lets the dashboard
+render a true before/after — a unified line diff for modified files and the
+recovered contents of deleted files — instead of "before not captured". To keep
+that archive small, scope `MILES_SANDBOX_STATE_ROOT` to the agent workspace
+(e.g. `/testbed`): one root governs both phases, so the before and after cover
+the same tree. Storage/latency note: the begin archive is captured **once per
+task** (the first rollout of each `instance_id`; the rest stamp a shared
+reference), inside that trial's `AGENT_START` window — so scoping the root and
+setting `MILES_SANDBOX_STATE_MAX_BEGIN_BYTES` keep both the per-task capture
+time and the capture PVC footprint bounded. Unscoped (`/`) on a real image is
+GBs per task and can exceed the 600s begin timeout or hit disk-full — don't.
+Confirm the running image actually has the begin-bytes SDK before relying on it:
+`"$HARBOR_VENV/bin/python" -c "from probe.connectors.harbor_runner import SandboxStateOptions; SandboxStateOptions(begin_bytes=True)"`
+must not raise (an older probe-research would).
 
 Run the authenticated oracle payload from `RUNPOD_E2E.md`. Require HTTP 200,
 `Submitted`, verifier output, a nonempty `provider_sandbox_id`, and Modal

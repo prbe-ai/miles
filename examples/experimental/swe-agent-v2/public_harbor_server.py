@@ -206,6 +206,7 @@ class Settings:
     sandbox_state_end_timeout_sec: float = 300.0
     sandbox_state_exclude: str = ""
     sandbox_state_hash: bool = False
+    sandbox_state_root: str = "/"
     sandbox_state_begin_bytes: bool = False
     sandbox_state_max_begin_bytes: int | None = None
     environment_type: str = "docker"
@@ -261,6 +262,7 @@ class Settings:
             sandbox_state_end_timeout_sec=float(os.getenv("MILES_SANDBOX_STATE_TIMEOUT_END", "300")),
             sandbox_state_exclude=os.getenv("MILES_SANDBOX_STATE_EXCLUDE", ""),
             sandbox_state_hash=_env_bool("MILES_SANDBOX_STATE_HASH", False),
+            sandbox_state_root=os.getenv("MILES_SANDBOX_STATE_ROOT", "/"),
             sandbox_state_begin_bytes=begin_bytes,
             sandbox_state_max_begin_bytes=int(raw_max_begin) if raw_max_begin else None,
             environment_type=os.getenv("HARBOR_ENVIRONMENT_TYPE", "docker"),
@@ -519,6 +521,11 @@ async def run_public_harbor_trial(request: RunRequest, settings: Settings) -> Ru
                     # begin manifest, so hashing is mandatory whenever we archive
                     # begin bytes (mtime drift between rollouts would defeat reuse).
                     hash_files=settings.sandbox_state_hash or capture_begin_bytes,
+                    # One scan root governs BOTH phases (begin manifest+bytes and
+                    # end manifest+delta), so the before and after archives cover
+                    # the same tree. Default "/" is the whole image; scope it to
+                    # the agent workspace (e.g. /testbed) to keep begin-bytes small.
+                    root=settings.sandbox_state_root,
                     exclude=tuple(part for part in settings.sandbox_state_exclude.split(":") if part),
                     begin_bytes=capture_begin_bytes,
                     begin_bytes_ref=begin_bytes_ref,

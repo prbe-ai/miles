@@ -109,6 +109,7 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
         begin_timeout_sec: float | None = 120.0
         end_timeout_sec: float = 300.0
         hash_files: bool = False
+        root: str = "/"
         exclude: tuple = ()
         max_files: int | None = None
         max_delta_bytes: int | None = None
@@ -210,6 +211,7 @@ async def test_sandbox_state_options_are_built_from_settings(tmp_path: Path, mon
         sandbox_state_end_timeout_sec=90.0,
         sandbox_state_hash=True,
         sandbox_state_exclude="/data:/var/cache",
+        sandbox_state_root="/testbed",
     )
 
     response = await server.run_public_harbor_trial(_run_request(), settings)
@@ -221,6 +223,9 @@ async def test_sandbox_state_options_are_built_from_settings(tmp_path: Path, mon
     assert options.end_timeout_sec == 90.0
     assert options.hash_files is True
     assert options.exclude == ("/data", "/var/cache")
+    # One scan root governs both phases (begin + end), keeping before/after
+    # symmetric; default "/" unless MILES_SANDBOX_STATE_ROOT scopes it.
+    assert options.root == "/testbed"
 
 
 @pytest.mark.asyncio
@@ -361,6 +366,16 @@ def test_settings_begin_bytes_bumps_begin_timeout_default(monkeypatch) -> None:
     assert s.sandbox_state_begin_timeout_sec == 600.0
     monkeypatch.setenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "200")
     assert server.Settings.from_env().sandbox_state_begin_timeout_sec == 200.0
+
+
+def test_settings_scan_root_defaults_to_slash_and_reads_env(monkeypatch) -> None:
+    monkeypatch.setenv("HARBOR_TASKS_DIR", "/tmp/tasks")
+    monkeypatch.setenv("MILES_HARBOR_CAPTURE_MODE", "shadow")
+    monkeypatch.setenv("MILES_SANDBOX_STATE", "1")
+    monkeypatch.delenv("MILES_SANDBOX_STATE_ROOT", raising=False)
+    assert server.Settings.from_env().sandbox_state_root == "/"
+    monkeypatch.setenv("MILES_SANDBOX_STATE_ROOT", "/testbed")
+    assert server.Settings.from_env().sandbox_state_root == "/testbed"
 
 
 @pytest.mark.asyncio
