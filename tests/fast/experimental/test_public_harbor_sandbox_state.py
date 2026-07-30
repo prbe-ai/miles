@@ -106,12 +106,15 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
 
     @dataclasses.dataclass
     class SandboxStateOptions:
-        begin_timeout_sec: float = 120.0
+        begin_timeout_sec: float | None = 120.0
         end_timeout_sec: float = 300.0
         hash_files: bool = False
         exclude: tuple = ()
         max_files: int | None = None
         max_delta_bytes: int | None = None
+        begin_bytes: bool = False
+        begin_bytes_ref: str | None = None
+        max_begin_bytes: int | None = None
 
     class FakeRecorder:
         def summary(self):
@@ -120,12 +123,15 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
     class FakeHandle:
         def __init__(self, trial, sandbox_state_options):
             self._trial = trial
+            self._options = sandbox_state_options
             self.sandbox_state = FakeRecorder() if sandbox_state_options is not None else None
             self.errors = []
 
         async def finalize(self, trial_dir, **kwargs):
             seen.update({"finalize_trial_dir": Path(trial_dir), **kwargs})
             recorder_summary = self.sandbox_state.summary() if self.sandbox_state is not None else None
+            # The SDK (>= 0.26.0) reports capture status on the result; simulate a
+            # verified archive whenever begin_bytes was requested.
             return SimpleNamespace(
                 status="complete",
                 staged_trial_dir=str(trial_dir),
@@ -139,6 +145,7 @@ def _install_fake_probe(monkeypatch, *, summary: dict | None = _SDK_SUMMARY):
                 sandbox_id="sbx__env",
                 provider_sandbox_id=None,
                 sandbox_state=recorder_summary,
+                begin_bytes_captured=bool(getattr(self._options, "begin_bytes", False)),
                 error=None,
             )
 
@@ -277,3 +284,110 @@ def test_create_app_preflight_checks_facade_modules_and_binaries(tmp_path: Path,
     sandbox_state_module.snapshot_binary_path = lambda arch: Path(__file__)
     app = server.create_app(settings)
     assert app.title == "Miles Public Harbor Bridge"
+
+
+# ---------------------------------------------------------------------------
+# begin-state bytes (probe-research 0.24.0): per-task shared before-content
+# ---------------------------------------------------------------------------
+def _fresh_ledger(monkeypatch) -> None:
+    """Isolate the module-global election ledger per test."""
+    monkeypatch.setattr(server, "_BEGIN_BYTES_LEDGER", server.BeginBytesLedger())
+
+
+@pytest.mark.asyncio
+async def test_begin_bytes_wired_into_options_when_enabled(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_harbor(monkeypatch)
+    seen = _install_fake_probe(monkeypatch)
+    _fresh_ledger(monkeypatch)
+    (tmp_path / "tasks" / "hello-world").mkdir(parents=True)
+
+    settings = _settings(tmp_path, sandbox_state_begin_bytes=True, sandbox_state_max_begin_bytes=123)
+    await server.run_public_harbor_trial(_run_request("hello-world"), settings)
+
+    options = seen["sandbox_state_options"]
+    assert options.begin_bytes is True
+    assert options.begin_bytes_ref == "hello-world"  # ref == instance_id (task id)
+    assert options.max_begin_bytes == 123
+    assert options.hash_files is True  # forced on for begin-bytes validity
+
+
+@pytest.mark.asyncio
+async def test_begin_bytes_off_by_default(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_harbor(monkeypatch)
+    seen = _install_fake_probe(monkeypatch)
+    _fresh_ledger(monkeypatch)
+    (tmp_path / "tasks" / "hello-world").mkdir(parents=True)
+
+    await server.run_public_harbor_trial(_run_request("hello-world"), _settings(tmp_path))
+
+    options = seen["sandbox_state_options"]
+    assert options.begin_bytes is False
+    assert options.begin_bytes_ref is None
+
+
+@pytest.mark.asyncio
+async def test_only_first_rollout_of_a_task_captures_siblings_share_ref(tmp_path: Path, monkeypatch) -> None:
+    _install_fake_harbor(monkeypatch)
+    _fresh_ledger(monkeypatch)
+    (tmp_path / "tasks" / "hello-world").mkdir(parents=True)
+    settings = _settings(tmp_path, sandbox_state_begin_bytes=True)
+
+    seen1 = _install_fake_probe(monkeypatch)
+    await server.run_public_harbor_trial(_run_request("hello-world"), settings)
+    first = seen1["sandbox_state_options"]
+
+    seen2 = _install_fake_probe(monkeypatch)  # sibling rollout, same task+run
+    await server.run_public_harbor_trial(_run_request("hello-world"), settings)
+    second = seen2["sandbox_state_options"]
+
+    assert first.begin_bytes is True and second.begin_bytes is False  # capture once
+    assert first.begin_bytes_ref == second.begin_bytes_ref == "hello-world"  # shared ref
+
+
+# ---- pure units: ledger, election, capture-signal read ----
+def test_settings_begin_bytes_requires_sandbox_state(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="MILES_SANDBOX_STATE_BEGIN_BYTES"):
+        _settings(tmp_path, sandbox_state=False, capture_mode="shadow", sandbox_state_begin_bytes=True)
+
+
+def test_settings_begin_bytes_bumps_begin_timeout_default(monkeypatch) -> None:
+    monkeypatch.setenv("HARBOR_TASKS_DIR", "/tmp/tasks")
+    monkeypatch.setenv("MILES_HARBOR_CAPTURE_MODE", "shadow")
+    monkeypatch.setenv("MILES_SANDBOX_STATE", "1")
+    monkeypatch.setenv("MILES_SANDBOX_STATE_BEGIN_BYTES", "1")
+    monkeypatch.delenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", raising=False)
+    s = server.Settings.from_env()
+    assert s.sandbox_state_begin_bytes is True
+    assert s.sandbox_state_begin_timeout_sec == 600.0
+    monkeypatch.setenv("MILES_SANDBOX_STATE_TIMEOUT_BEGIN", "200")
+    assert server.Settings.from_env().sandbox_state_begin_timeout_sec == 200.0
+
+
+@pytest.mark.asyncio
+async def test_ledger_elects_one_and_reelects_only_after_failure() -> None:
+    ledger = server.BeginBytesLedger()
+    assert await ledger.claim("r", "t") is True
+    assert await ledger.claim("r", "t") is False  # in-flight -> denied
+    await ledger.release("r", "t", succeeded=False)  # first attempt failed
+    assert await ledger.claim("r", "t") is True  # a later rollout retries
+    await ledger.release("r", "t", succeeded=True)  # this one worked
+    assert await ledger.claim("r", "t") is False  # latched: no more captures
+    assert await ledger.claim("r", "other") is True  # different task -> own capture
+
+
+@pytest.mark.asyncio
+async def test_election_latches_on_captured_result_from_finalize(tmp_path: Path, monkeypatch) -> None:
+    """The elected trial's release reads result.begin_bytes_captured (SDK >=
+    0.26.0): a captured run latches the (run, task) slot so siblings don't
+    re-capture."""
+    _install_fake_harbor(monkeypatch)
+    _fresh_ledger(monkeypatch)
+    (tmp_path / "tasks" / "hello-world").mkdir(parents=True)
+    settings = _settings(tmp_path, sandbox_state_begin_bytes=True)
+
+    _install_fake_probe(monkeypatch)  # fake finalize -> begin_bytes_captured=True
+    await server.run_public_harbor_trial(_run_request("hello-world"), settings)
+
+    # Slot latched: a fresh sibling rollout is denied capture.
+    captured, ref, key = await server._elect_begin_bytes(settings, _run_request("hello-world"))
+    assert captured is False and key is None and ref == "hello-world"
